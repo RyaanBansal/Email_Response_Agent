@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Email Agent Admin</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #252836;
+    --border: #2e3144;
+    --accent: #4f8ef7;
+    --accent-hover: #3a7de6;
+    --danger: #e05263;
+    --warn: #f0a443;
+    --success: #4caf86;
+    --text: #e2e4ec;
+    --muted: #7b7f94;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
+
+  /* Layout */
+  #app { display: flex; min-height: 100vh; }
+  #sidebar { width: 220px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 0; flex-shrink: 0; }
+  #main { flex: 1; padding: 32px 36px; overflow-y: auto; }
+
+  /* Sidebar */
+  .sidebar-header { padding: 20px 18px 14px; border-bottom: 1px solid var(--border); }
+  .sidebar-header h2 { font-size: 16px; font-weight: 700; }
+  .sidebar-header small { color: var(--muted); font-size: 12px; display: block; margin-top: 2px; word-break: break-all; }
+  nav { flex: 1; padding: 10px 0; }
+  nav a { display: flex; align-items: center; gap: 10px; padding: 10px 18px; color: var(--muted); text-decoration: none; font-size: 13px; cursor: pointer; transition: all .15s; }
+  nav a:hover, nav a.active { color: var(--text); background: var(--surface2); }
+  nav a.active { border-left: 3px solid var(--accent); padding-left: 15px; }
+  .sidebar-actions { padding: 14px 18px; border-top: 1px solid var(--border); display: flex; gap: 8px; }
+  .sidebar-actions button { flex: 1; }
+
+  /* Auth screen */
+  #auth-screen { display: flex; align-items: center; justify-content: center; min-height: 100vh; background: var(--bg); }
+  .login-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 40px; width: 380px; }
+  .login-card h1 { font-size: 22px; margin-bottom: 6px; }
+  .login-card p { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+
+  /* Forms */
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; margin-top: 14px; font-weight: 500; text-transform: uppercase; letter-spacing: .4px; }
+  input[type=text], input[type=email], input[type=password], input[type=number], textarea, select {
+    width: 100%; background: var(--surface2); border: 1px solid var(--border); border-radius: 7px;
+    color: var(--text); padding: 9px 12px; font-size: 14px; transition: border .15s;
+  }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
+  textarea { resize: vertical; font-family: inherit; }
+  select option { background: var(--surface2); }
+
+  /* Buttons */
+  button, .btn { cursor: pointer; border: none; border-radius: 7px; padding: 9px 16px; font-size: 13px; font-weight: 500; transition: all .15s; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-danger  { background: var(--danger); color: #fff; }
+  .btn-danger:hover  { background: #c0394a; }
+  .btn-ghost  { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+  .btn-ghost:hover { background: var(--border); }
+  .btn-sm { padding: 6px 12px; font-size: 12px; }
+  .btn-warn { background: var(--warn); color: #000; }
+  .btn-success { background: var(--success); color: #fff; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .btn-full { width: 100%; margin-top: 12px; }
+
+  /* Cards / expanders */
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 14px; }
+  .expander { border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 12px; overflow: hidden; }
+  .expander-header { background: var(--surface); padding: 14px 18px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; font-size: 13px; user-select: none; }
+  .expander-header:hover { background: var(--surface2); }
+  .expander-body { background: var(--bg); padding: 18px; display: none; border-top: 1px solid var(--border); }
+  .expander-body.open { display: block; }
+  .chevron { transition: transform .2s; font-size: 12px; color: var(--muted); }
+  .open .chevron { transform: rotate(180deg); }
+
+  /* Metrics */
+  .metrics { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; margin-bottom: 28px; }
+  .metric { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; }
+  .metric .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .metric .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+
+  /* Table */
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  tr:last-child td { border-bottom: none; }
+
+  /* Alerts */
+  .alert { padding: 12px 16px; border-radius: 8px; margin: 10px 0; font-size: 13px; }
+  .alert-success { background: rgba(76,175,134,.15); border: 1px solid rgba(76,175,134,.3); color: var(--success); }
+  .alert-error   { background: rgba(224,82,99,.15); border: 1px solid rgba(224,82,99,.3); color: var(--danger); }
+  .alert-info    { background: rgba(79,142,247,.12); border: 1px solid rgba(79,142,247,.3); color: var(--accent); }
+
+  /* Misc */
+  h1 { font-size: 24px; font-weight: 700; margin-bottom: 24px; }
+  h2 { font-size: 18px; font-weight: 600; margin: 20px 0 12px; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .three-col { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; background: rgba(240,164,67,.2); color: var(--warn); margin-left: 8px; }
+  .divider { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
+  #toast { position: fixed; bottom: 24px; right: 24px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; }
+  .toast-item { padding: 12px 18px; border-radius: 9px; font-size: 13px; font-weight: 500; animation: fadeIn .2s; max-width: 320px; }
+  @keyframes fadeIn { from { opacity:0; transform: translateY(10px); } to { opacity:1; transform: translateY(0); } }
+  .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loading { color: var(--muted); padding: 40px; text-align: center; }
+</style>
+</head>
+<body>
+
+<!-- Auth Screen -->
+<div id="auth-screen" style="display:none">
+  <div class="login-card">
+    <h1>✉️ Email Agent</h1>
+    <p>Sign in with your admin account</p>
+    <div id="login-error" class="alert alert-error" style="display:none"></div>
+    <label>Email Address</label>
+    <input type="email" id="login-email" placeholder="you@example.com" />
+    <label>Password</label>
+    <input type="password" id="login-password" />
+    <button class="btn btn-primary btn-full" id="login-btn" onclick="doLogin()">Sign In</button>
+  </div>
+</div>
+
+<!-- Main App -->
+<div id="app" style="display:none">
+  <div id="sidebar">
+    <div class="sidebar-header">
+      <h2>✉️ Email Agent</h2>
+      <small id="sidebar-user"></small>
+    </div>
+    <nav>
+      <a onclick="navigate('dashboard')"   id="nav-dashboard">📊 Dashboard</a>
+      <a onclick="navigate('approvals')"   id="nav-approvals">⏳ Pending Approvals</a>
+      <a onclick="navigate('manual')"      id="nav-manual">🔁 Manual Queue</a>
+      <a onclick="navigate('sent')"        id="nav-sent">✅ Sent Emails</a>
+      <a onclick="navigate('templates')"   id="nav-templates">📋 Templates</a>
+      <a onclick="navigate('settings')"    id="nav-settings">⚙️ Settings</a>
+    </nav>
+    <div class="sidebar-actions">
+      <button class="btn btn-ghost btn-sm" onclick="pollNow()">🔄 Poll</button>
+      <button class="btn btn-ghost btn-sm" onclick="doLogout()">🚪 Out</button>
+    </div>
+  </div>
+  <div id="main">
+    <div id="page-content" class="loading"><span class="spinner"></span> Loading…</div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ── State ────────────────────────────────────────────────────────────────────
+let currentPage = 'dashboard';
+let currentUser = null;
+
+// ── API ──────────────────────────────────────────────────────────────────────
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' }, credentials: 'include' };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const res = await fetch('/api' + path, opts);
+  if (res.status === 401) { showAuth(); return null; }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || res.statusText);
+  return data;
+}
+
+// ── Toast ────────────────────────────────────────────────────────────────────
+function toast(msg, type='success') {
+  const el = document.createElement('div');
+  el.className = 'toast-item';
+  el.style.background = type === 'success' ? 'rgba(76,175,134,.9)' : type === 'error' ? 'rgba(224,82,99,.9)' : 'rgba(79,142,247,.9)';
+  el.style.color = type === 'warn' ? '#000' : '#fff';
+  el.textContent = msg;
+  document.getElementById('toast').appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+// ── Auth ─────────────────────────────────────────────────────────────────────
+async function init() {
+  const user = await api('GET', '/auth/me').catch(() => null);
+  if (user) { currentUser = user; showApp(); }
+  else { showAuth(); }
+}
+
+function showAuth() {
+  document.getElementById('auth-screen').style.display = 'flex';
+  document.getElementById('app').style.display = 'none';
+}
+
+function showApp() {
+  document.getElementById('auth-screen').style.display = 'none';
+  document.getElementById('app').style.display = 'flex';
+  document.getElementById('sidebar-user').textContent = currentUser?.email || '';
+  navigate('dashboard');
+}
+
+async function doLogin() {
+  const btn = document.getElementById('login-btn');
+  btn.disabled = true; btn.textContent = 'Signing in…';
+  const errEl = document.getElementById('login-error');
+  errEl.style.display = 'none';
+  try {
+    const user = await api('POST', '/auth/login', {
+      email: document.getElementById('login-email').value,
+      password: document.getElementById('login-password').value,
+    });
+    if (user) { currentUser = { email: user.user_email }; showApp(); }
+  } catch(e) {
+    errEl.textContent = e.message; errEl.style.display = 'block';
+  } finally { btn.disabled = false; btn.textContent = 'Sign In'; }
+}
+
+async function doLogout() {
+  await api('POST', '/auth/logout').catch(() => {});
+  currentUser = null; showAuth();
+}
+
+// ── Navigation ───────────────────────────────────────────────────────────────
+function navigate(page) {
+  currentPage = page;
+  document.querySelectorAll('nav a').forEach(a => a.classList.remove('active'));
+  const el = document.getElementById('nav-' + page);
+  if (el) el.classList.add('active');
+  renderPage(page);
+}
+
+function renderPage(page) {
+  const content = document.getElementById('page-content');
+  content.innerHTML = '<div class="loading"><span class="spinner"></span> Loading…</div>';
+  const pages = { dashboard, approvals, manualQueue, sentEmails, templates, settings };
+  const fn = pages[page === 'manual' ? 'manualQueue' : page === 'sent' ? 'sentEmails' : page];
+  if (fn) fn();
+}
+
+// ── Poll Now ─────────────────────────────────────────────────────────────────
+async function pollNow() {
+  try {
+    await api('POST', '/settings/run-pipeline');
+    toast('Inbox polled!');
+    if (currentPage === 'dashboard') dashboard();
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ══════════════════════════════════════════════════════════════════════════════
+async function dashboard() {
+  const data = await api('GET', '/dashboard');
+  if (!data) return;
+  const c = document.getElementById('page-content');
+  c.innerHTML = `
+    <h1>Dashboard</h1>
+    <div class="metrics">
+      <div class="metric"><div class="label">📥 Received Today</div><div class="value">${data.received_today}</div></div>
+      <div class="metric"><div class="label">⏳ Pending</div><div class="value">${data.pending}</div></div>
+      <div class="metric"><div class="label">⏰ Scheduled</div><div class="value">${data.approved}</div></div>
+      <div class="metric"><div class="label">✅ Sent</div><div class="value">${data.sent}</div></div>
+      <div class="metric"><div class="label">🔁 Manual Queue</div><div class="value">${data.manual_queue}</div></div>
+      <div class="metric"><div class="label">⏱ Avg Response (min)</div><div class="value">${data.avg_response_min}</div></div>
+    </div>
+    <hr class="divider">
+    <h2>Recent Activity</h2>
+    ${data.recent_activity.length ? `
+    <div class="card" style="padding:0;overflow:hidden">
+      <table>
+        <thead><tr><th>Time</th><th>Action</th><th>Detail</th></tr></thead>
+        <tbody>
+          ${data.recent_activity.map(r => `<tr><td class="muted">${r.time}</td><td>${r.action}</td><td>${r.detail}</td></tr>`).join('')}
+        </tbody>
+      </table>
+    </div>` : '<div class="alert alert-info">No activity yet. Click Poll to fetch emails.</div>'}
+  `;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PENDING APPROVALS
+// ══════════════════════════════════════════════════════════════════════════════
+async function approvals() {
+  const data = await api('GET', '/approvals');
+  if (!data) return;
+  const c = document.getElementById('page-content');
+  if (!data.length) {
+    c.innerHTML = '<h1>Pending Approvals</h1><div class="alert alert-success">All caught up — no drafts waiting.</div>';
+    return;
+  }
+  c.innerHTML = `<h1>Pending Approvals</h1><p style="margin-bottom:16px;color:var(--muted)">${data.length} draft(s) awaiting review</p>` +
+    data.map(item => {
+      const { draft, email, delay_badge } = item;
+      const conf = Math.round((draft.confidence || 0) * 100);
+      const badge = delay_badge ? `<span class="badge">⏰ ${delay_badge}</span>` : '';
+      const body = draft.edited_body || draft.draft_body || '';
+      return `
+      <div class="expander" id="exp-${draft.id}">
+        <div class="expander-header" onclick="toggleExp(${draft.id})">
+          <span>📧 <strong>${email.sender}</strong> &nbsp;|&nbsp; ${email.subject || '(no subject)'} &nbsp;|&nbsp; Type: ${email.query_type || 'unknown'} &nbsp;|&nbsp; ${conf}% confidence ${badge}</span>
+          <span class="chevron">▼</span>
+        </div>
+        <div class="expander-body open" id="exp-body-${draft.id}">
+          <div class="two-col">
+            <div>
+              <label>Original Email</label>
+              <textarea rows="8" disabled style="opacity:.7">${esc(email.body || '')}</textarea>
+              <p class="muted" style="margin-top:6px">Received: ${(email.received_at||'').slice(0,16).replace('T',' ')}</p>
+            </div>
+            <div>
+              <label>AI Draft Response (editable)</label>
+              <textarea rows="8" id="draft-body-${draft.id}">${esc(body)}</textarea>
+            </div>
+          </div>
+          <div class="row" style="margin-top:14px">
+            <button class="btn btn-primary" onclick="approveDraft(${draft.id})">${delay_badge ? '✅ Approve & Schedule' : '✅ Approve & Send'}</button>
+            <button class="btn btn-ghost"   onclick="saveEdits(${draft.id})">♻️ Save Edits</button>
+            <input  type="text" id="reject-note-${draft.id}" placeholder="Reject reason (optional)" style="flex:1;min-width:180px">
+            <button class="btn btn-danger"  onclick="rejectDraft(${draft.id})">❌ Reject</button>
+          </div>
+          <div id="approval-msg-${draft.id}"></div>
+        </div>
+      </div>`;
+    }).join('');
+}
+
+function toggleExp(id) {
+  const body = document.getElementById('exp-body-' + id);
+  const header = body.previousElementSibling;
+  body.classList.toggle('open');
+  header.querySelector('.chevron').style.transform = body.classList.contains('open') ? 'rotate(180deg)' : '';
+}
+
+async function approveDraft(id) {
+  const body = document.getElementById('draft-body-' + id).value;
+  const msgEl = document.getElementById('approval-msg-' + id);
+  try {
+    await api('POST', `/approvals/${id}/approve`, { body });
+    toast('Approved!');
+    approvals();
+  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+}
+
+async function saveEdits(id) {
+  const body = document.getElementById('draft-body-' + id).value;
+  const msgEl = document.getElementById('approval-msg-' + id);
+  try {
+    await api('POST', `/approvals/${id}/save`, { body });
+    msgEl.innerHTML = '<div class="alert alert-info">Edits saved.</div>';
+  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+}
+
+async function rejectDraft(id) {
+  const note = document.getElementById('reject-note-' + id).value;
+  const msgEl = document.getElementById('approval-msg-' + id);
+  try {
+    await api('POST', `/approvals/${id}/reject`, { note });
+    toast('Draft rejected.', 'warn');
+    approvals();
+  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MANUAL QUEUE
+// ══════════════════════════════════════════════════════════════════════════════
+async function manualQueue() {
+  const data = await api('GET', '/manual');
+  if (!data) return;
+  const c = document.getElementById('page-content');
+  if (!data.length) {
+    c.innerHTML = '<h1>Manual Queue</h1><div class="alert alert-success">Manual queue is empty.</div>';
+    return;
+  }
+  c.innerHTML = '<h1>Manual Queue — Repeat Senders</h1>' +
+    data.map(em => `
+    <div class="expander" id="mexp-${em.id}">
+      <div class="expander-header" onclick="toggleMExp(${em.id})">
+        <span>🔁 <strong>${em.sender}</strong> &nbsp;|&nbsp; ${em.subject||''} &nbsp;|&nbsp; Email #${em.sender_count||1} from this sender</span>
+        <span class="chevron" style="transform:rotate(180deg)">▼</span>
+      </div>
+      <div class="expander-body open" id="mexp-body-${em.id}">
+        <p style="white-space:pre-wrap;margin-bottom:10px">${esc(em.body||'')}</p>
+        <p class="muted" style="margin-bottom:14px">Received: ${(em.received_at||'').slice(0,16).replace('T',' ')}</p>
+        <button class="btn btn-primary btn-sm" onclick="generateManual(${em.id})">Generate Draft Anyway</button>
+        <div id="mq-msg-${em.id}" style="margin-top:8px"></div>
+      </div>
+    </div>`).join('');
+}
+
+function toggleMExp(id) {
+  const body = document.getElementById('mexp-body-' + id);
+  body.classList.toggle('open');
+}
+
+async function generateManual(id) {
+  const msgEl = document.getElementById('mq-msg-' + id);
+  msgEl.innerHTML = '<span class="spinner"></span> Generating…';
+  try {
+    await api('POST', `/manual/${id}/generate`);
+    toast('Draft generated — check Pending Approvals.');
+    manualQueue();
+  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SENT EMAILS
+// ══════════════════════════════════════════════════════════════════════════════
+async function sentEmails() {
+  const data = await api('GET', '/sent');
+  if (!data) return;
+  const c = document.getElementById('page-content');
+  if (!data.length) {
+    c.innerHTML = '<h1>Sent Emails</h1><div class="alert alert-info">No emails sent yet.</div>';
+    return;
+  }
+  c.innerHTML = '<h1>Sent Emails</h1>' +
+    data.map(item => {
+      const { email: em, sent_body, sent_at } = item;
+      return `
+      <div class="expander">
+        <div class="expander-header" onclick="this.nextElementSibling.classList.toggle('open');this.querySelector('.chevron').style.transform=this.nextElementSibling.classList.contains('open')?'rotate(180deg)':''">
+          <span>✅ <strong>${em.sender}</strong> &nbsp;|&nbsp; ${em.subject||''} &nbsp;|&nbsp; ${(em.received_at||'').slice(0,10)}</span>
+          <span class="chevron">▼</span>
+        </div>
+        <div class="expander-body">
+          <div class="two-col">
+            <div><label>Original</label><textarea rows="6" disabled style="opacity:.7">${esc(em.body||'')}</textarea></div>
+            <div><label>Sent Response</label><textarea rows="6" disabled style="opacity:.7">${esc(sent_body||'')}</textarea></div>
+          </div>
+          ${sent_at ? `<p class="muted" style="margin-top:8px">Sent at: ${sent_at.slice(0,16).replace('T',' ')}</p>` : ''}
+        </div>
+      </div>`;
+    }).join('');
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TEMPLATES
+// ══════════════════════════════════════════════════════════════════════════════
+async function templates() {
+  const data = await api('GET', '/templates');
+  if (!data) return;
+  const c = document.getElementById('page-content');
+
+  const tmplHtml = data.map(t => {
+    const delay = t.send_delay_seconds || 0;
+    let initUnit = 'Minutes', initVal = 0;
+    if (delay >= 86400 && delay % 86400 === 0) { initUnit = 'Days'; initVal = delay / 86400; }
+    else if (delay >= 3600 && delay % 3600 === 0) { initUnit = 'Hours'; initVal = delay / 3600; }
+    else if (delay > 0) { initUnit = 'Minutes'; initVal = Math.floor(delay / 60); }
+
+    return `
+    <div class="expander">
+      <div class="expander-header" onclick="this.nextElementSibling.classList.toggle('open');this.querySelector('.chevron').style.transform=this.nextElementSibling.classList.contains('open')?'rotate(180deg)':''">
+        <span>📋 <strong>${t.name}</strong> &nbsp;|&nbsp; Type: ${t.query_type||''}</span>
+        <span class="chevron">▼</span>
+      </div>
+      <div class="expander-body">
+        <label>Subject</label>
+        <input type="text" id="ts-${t.id}" value="${esc(t.subject||'')}">
+        <label>Body</label>
+        <textarea rows="6" id="tb-${t.id}">${esc(t.body||'')}</textarea>
+        <label style="margin-top:14px">Send Delay After Approval</label>
+        <div class="three-col" style="margin-top:4px">
+          <div>
+            <label>Amount</label>
+            <input type="number" id="tdv-${t.id}" min="0" value="${initVal}">
+          </div>
+          <div>
+            <label>Unit</label>
+            <select id="tdu-${t.id}">
+              <option ${initUnit==='Minutes'?'selected':''}>Minutes</option>
+              <option ${initUnit==='Hours'?'selected':''}>Hours</option>
+              <option ${initUnit==='Days'?'selected':''}>Days</option>
+            </select>
+          </div>
+          <div style="display:flex;align-items:flex-end">
+            <span class="muted" id="tdc-${t.id}">${delayCaption(initVal, initUnit)}</span>
+          </div>
+        </div>
+        <div id="tmpl-msg-${t.id}" style="margin-top:8px"></div>
+        <button class="btn btn-primary btn-sm" style="margin-top:12px" onclick="saveTemplate(${t.id})">Save</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  c.innerHTML = `
+    <h1>Response Templates</h1>
+    <p class="muted" style="margin-bottom:16px">Use <code>{{ai_response}}</code> and <code>{{customer_name}}</code> as placeholders.</p>
+    ${tmplHtml}
+    <hr class="divider">
+    <h2>Add New Template</h2>
+    <div class="card">
+      <label>Name (unique)</label><input type="text" id="n-name">
+      <label>Query Type</label>
+      <select id="n-type">
+        <option>billing</option><option>technical</option><option>general</option>
+        <option>complaint</option><option>refund</option><option>onboarding</option>
+      </select>
+      <label>Subject Line</label><input type="text" id="n-subj">
+      <label>Body</label><textarea rows="5" id="n-body"></textarea>
+      <label style="margin-top:14px">Send Delay After Approval</label>
+      <div class="two-col">
+        <div><label>Amount</label><input type="number" id="n-dv" min="0" value="0"></div>
+        <div><label>Unit</label><select id="n-du"><option>Minutes</option><option>Hours</option><option>Days</option></select></div>
+      </div>
+      <div id="new-tmpl-msg" style="margin-top:8px"></div>
+      <button class="btn btn-primary" style="margin-top:14px" onclick="createTemplate()">Create Template</button>
+    </div>`;
+}
+
+function delayCaption(val, unit) {
+  if (!val || val == 0) return '⚡ Send immediately';
+  return `⏰ Send ${val} ${unit.toLowerCase()} after approval`;
+}
+
+async function saveTemplate(id) {
+  const subject = document.getElementById('ts-' + id).value;
+  const body = document.getElementById('tb-' + id).value;
+  const val = parseInt(document.getElementById('tdv-' + id).value) || 0;
+  const unit = document.getElementById('tdu-' + id).value;
+  const mult = { Minutes: 60, Hours: 3600, Days: 86400 }[unit];
+  const delay = val > 0 ? val * mult : null;
+  const msgEl = document.getElementById('tmpl-msg-' + id);
+  try {
+    await api('PUT', `/templates/${id}`, { subject, body, send_delay_seconds: delay });
+    msgEl.innerHTML = '<div class="alert alert-success">Template saved.</div>';
+  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+}
+
+async function createTemplate() {
+  const name = document.getElementById('n-name').value;
+  const query_type = document.getElementById('n-type').value;
+  const subject = document.getElementById('n-subj').value;
+  const body = document.getElementById('n-body').value;
+  const val = parseInt(document.getElementById('n-dv').value) || 0;
+  const unit = document.getElementById('n-du').value;
+  const mult = { Minutes: 60, Hours: 3600, Days: 86400 }[unit];
+  const delay = val > 0 ? val * mult : null;
+  const msgEl = document.getElementById('new-tmpl-msg');
+  try {
+    await api('POST', '/templates', { name, query_type, subject, body, send_delay_seconds: delay });
+    toast('Template created!');
+    templates();
+  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SETTINGS
+// ══════════════════════════════════════════════════════════════════════════════
+async function settings() {
+  const data = await api('GET', '/settings');
+  if (!data) return;
+  const c = document.getElementById('page-content');
+  c.innerHTML = `
+    <h1>⚙️ Settings</h1>
+    <p class="muted" style="margin-bottom:20px">Changes are saved to the database and take effect immediately — no restart needed.</p>
+
+    <div class="expander">
+      <div class="expander-header" onclick="this.nextElementSibling.classList.toggle('open')"><span>📧 Email Account</span><span class="chevron" style="transform:rotate(180deg)">▼</span></div>
+      <div class="expander-body open">
+        <label>Sender Address (EMAIL_ADDRESS)</label>
+        <input type="text" id="s-EMAIL_ADDRESS" value="${esc(data.EMAIL_ADDRESS||'')}">
+        <label>Email Password (EMAIL_PASSWORD) 🔒</label>
+        <input type="password" id="s-EMAIL_PASSWORD" value="${esc(data.EMAIL_PASSWORD||'')}">
+      </div>
+    </div>
+
+    <div class="expander">
+      <div class="expander-header" onclick="this.nextElementSibling.classList.toggle('open')"><span>📥 IMAP (Incoming Mail)</span><span class="chevron">▼</span></div>
+      <div class="expander-body">
+        <div class="two-col">
+          <div><label>IMAP Host</label><input type="text" id="s-IMAP_HOST" value="${esc(data.IMAP_HOST||'imap.gmail.com')}"></div>
+          <div><label>IMAP Port</label><input type="number" id="s-IMAP_PORT" value="${data.IMAP_PORT||993}"></div>
+        </div>
+        <label>Sent Folder Override</label>
+        <input type="text" id="s-IMAP_SENT_FOLDER" value="${esc(data.IMAP_SENT_FOLDER||'')}" placeholder="Leave blank for auto-detect">
+      </div>
+    </div>
+
+    <div class="expander">
+      <div class="expander-header" onclick="this.nextElementSibling.classList.toggle('open')"><span>📤 SMTP (Outgoing Mail)</span><span class="chevron">▼</span></div>
+      <div class="expander-body">
+        <div class="three-col">
+          <div><label>SMTP Host</label><input type="text" id="s-SMTP_HOST" value="${esc(data.SMTP_HOST||'smtp.gmail.com')}"></div>
+          <div><label>SMTP Port</label><input type="number" id="s-SMTP_PORT" value="${data.SMTP_PORT||587}"></div>
+          <div><label>SMTP Mode</label>
+            <select id="s-SMTP_MODE">
+              <option value="auto" ${data.SMTP_MODE==='auto'||!data.SMTP_MODE?'selected':''}>auto</option>
+              <option value="ssl" ${data.SMTP_MODE==='ssl'?'selected':''}>ssl</option>
+              <option value="starttls" ${data.SMTP_MODE==='starttls'?'selected':''}>starttls</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="expander">
+      <div class="expander-header" onclick="this.nextElementSibling.classList.toggle('open')"><span>🤖 Agent Behaviour</span><span class="chevron">▼</span></div>
+      <div class="expander-body">
+        <div class="two-col">
+          <div><label>Poll Interval (seconds)</label><input type="number" id="s-POLL_INTERVAL_SECONDS" value="${data.POLL_INTERVAL_SECONDS||60}" min="10" max="86400"></div>
+          <div><label>Max Repeat Count (before manual queue)</label><input type="number" id="s-MAX_REPEAT_COUNT" value="${data.MAX_REPEAT_COUNT||3}" min="1"></div>
+        </div>
+        <label>Gemini Model</label>
+        <input type="text" id="s-GEMINI_MODEL" value="${esc(data.GEMINI_MODEL||'gemma-4-31b-it')}">
+      </div>
+    </div>
+
+    <hr class="divider">
+    <div id="settings-msg"></div>
+    <div class="row">
+      <button class="btn btn-primary" onclick="saveSettings()">💾 Save All Settings</button>
+      <button class="btn btn-ghost" onclick="testSmtp()">🔌 Test SMTP Connection</button>
+      <button class="btn btn-ghost" onclick="runPipeline()">▶ Run Pipeline Now</button>
+    </div>
+    <div id="smtp-test-msg" style="margin-top:10px"></div>
+  `;
+}
+
+async function saveSettings() {
+  const keys = ['EMAIL_ADDRESS','EMAIL_PASSWORD','IMAP_HOST','IMAP_PORT','IMAP_SENT_FOLDER','SMTP_HOST','SMTP_PORT','SMTP_MODE','POLL_INTERVAL_SECONDS','MAX_REPEAT_COUNT','GEMINI_MODEL'];
+  const settingsPayload = {};
+  keys.forEach(k => {
+    const el = document.getElementById('s-' + k);
+    if (el) settingsPayload[k] = el.value;
+  });
+  const msgEl = document.getElementById('settings-msg');
+  try {
+    await api('POST', '/settings', { settings: settingsPayload });
+    msgEl.innerHTML = '<div class="alert alert-success">✅ Settings saved!</div>';
+  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+}
+
+async function testSmtp() {
+  const msgEl = document.getElementById('smtp-test-msg');
+  msgEl.innerHTML = '<span class="spinner"></span> Testing…';
+  const pw = document.getElementById('s-EMAIL_PASSWORD').value;
+  try {
+    const res = await api('POST', '/settings/test-smtp', {
+      host: document.getElementById('s-SMTP_HOST').value,
+      port: parseInt(document.getElementById('s-SMTP_PORT').value),
+      mode: document.getElementById('s-SMTP_MODE').value,
+      address: document.getElementById('s-EMAIL_ADDRESS').value,
+      password: pw !== '••••••••' ? pw : '',
+    });
+    msgEl.innerHTML = `<div class="alert alert-success">${res.detail}</div>`;
+  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+}
+
+async function runPipeline() {
+  const msgEl = document.getElementById('smtp-test-msg');
+  msgEl.innerHTML = '<span class="spinner"></span> Running pipeline…';
+  try {
+    await api('POST', '/settings/run-pipeline');
+    msgEl.innerHTML = '<div class="alert alert-success">Pipeline complete.</div>';
+  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+}
+
+// ── Utility ──────────────────────────────────────────────────────────────────
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+init();
+</script>
+</body>
+</html>
