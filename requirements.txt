@@ -1,0 +1,12 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+pydantic==2.7.1
+google-genai>=1.0.0
+imapclient==3.0.1
+python-dotenv==1.0.1
+jinja2==3.1.4
+apscheduler==3.10.4
+loguru==0.7.2
+supabase==2.5.3
+PyJWT==2.8.0
+python-multipart==0.0.9

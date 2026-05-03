@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: email-agent-admin
+    env: python
+    region: oregon          # change to your preferred region
+    plan: starter           # free tier; upgrade to 'standard' for always-on
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/auth/me
+    envVars:
+      - key: SUPABASE_URL
+        sync: false         # fill in Render dashboard → Environment
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: EMAIL_ADDRESS
+        sync: false
+      - key: EMAIL_PASSWORD
+        sync: false
+      - key: IMAP_HOST
+        value: imap.gmail.com
+      - key: IMAP_PORT
+        value: "993"
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_MODE
+        value: starttls
+      - key: POLL_INTERVAL_SECONDS
+        value: "60"
+      - key: MAX_REPEAT_COUNT
+        value: "3"
+      - key: GEMINI_MODEL
+        value: gemma-4-31b-it
+      - key: PYTHON_VERSION
+        value: "3.11.0"
