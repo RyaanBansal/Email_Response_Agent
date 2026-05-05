@@ -89,14 +89,14 @@ def _do_send(draft_id: int, draft: dict, record: dict) -> bool:
     return False
 
 
-def approve_and_send(draft_id: int) -> bool:
+def approve_and_send(draft_id: int, force_immediate: bool = False) -> bool:
     """
     Approve a draft.
 
-    • If the matching template has send_delay_seconds set, the draft is marked
-      'approved' and scheduled_send_at is stamped. The scheduler will call
-      dispatch_scheduled_drafts() to pick it up later.
-    • Otherwise sends immediately (original behaviour).
+    • If force_immediate=True, bypasses any template timer and sends right away.
+    • If the matching template has send_delay_seconds set (and force_immediate
+      is False), the draft is scheduled. The scheduler flushes it later.
+    • Otherwise sends immediately.
 
     Returns:
       True  — either sent immediately or scheduled successfully
@@ -117,7 +117,7 @@ def approve_and_send(draft_id: int) -> bool:
     tmpl = get_template_by_query_type(query_type)
     delay_seconds = tmpl.get("send_delay_seconds") if tmpl else None
 
-    if delay_seconds and int(delay_seconds) > 0:
+    if not force_immediate and delay_seconds and int(delay_seconds) > 0:
         # Schedule the send
         send_at = (datetime.now(timezone.utc) + timedelta(seconds=int(delay_seconds))).isoformat()
         now     = datetime.now(timezone.utc).isoformat()
@@ -130,7 +130,12 @@ def approve_and_send(draft_id: int) -> bool:
         logger.info(f"Draft {draft_id} scheduled to send at {send_at}")
         return True  # "success" — just deferred
 
-    # No delay → send immediately
+    # No delay or force_immediate → send right now
+    if force_immediate and delay_seconds and int(delay_seconds) > 0:
+        logger.info(f"Draft {draft_id} — timer overridden, sending immediately.")
+        insert_log(record["id"], "timer_overridden",
+                   f"Draft {draft_id} sent immediately despite {delay_seconds}s timer.")
+
     now = datetime.now(timezone.utc).isoformat()
     update_draft(draft_id, approved_at=now)
     return _do_send(draft_id, draft, record)
