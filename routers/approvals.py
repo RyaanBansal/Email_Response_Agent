@@ -48,6 +48,7 @@ def list_pending(_user=Depends(get_current_user)):
 
 class SaveBody(BaseModel):
     body: str
+    force_immediate: bool = False
 
 
 class RejectBody(BaseModel):
@@ -56,10 +57,12 @@ class RejectBody(BaseModel):
 
 @router.post("/{draft_id}/approve")
 def approve(draft_id: int, body: SaveBody, _user=Depends(get_current_user)):
-    """Save edits (if any) then approve and send/schedule."""
+    """Save edits (if any) then approve and send/schedule.
+    If force_immediate=True, bypass the template timer and send right away.
+    """
     if body.body:
         save_edited_draft(draft_id, body.body)
-    success = approve_and_send(draft_id)
+    success = approve_and_send(draft_id, force_immediate=body.force_immediate)
     if not success:
         raise HTTPException(status_code=500, detail="Send failed — check SMTP config.")
     return {"detail": "ok"}
