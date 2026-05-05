@@ -316,7 +316,11 @@ async function approvals() {
             </div>
           </div>
           <div class="row" style="margin-top:14px">
-            <button class="btn btn-primary" onclick="approveDraft(${draft.id})">${delay_badge ? '✅ Approve & Schedule' : '✅ Approve & Send'}</button>
+            ${delay_badge
+              ? `<button class="btn btn-primary" onclick="approveDraft(${draft.id}, false)">⏰ Approve & Schedule (${delay_badge})</button>
+                 <button class="btn btn-success"  onclick="approveDraft(${draft.id}, true)" style="background:var(--success)">⚡ Send Immediately</button>`
+              : `<button class="btn btn-primary" onclick="approveDraft(${draft.id}, false)">✅ Approve & Send</button>`
+            }
             <button class="btn btn-ghost"   onclick="saveEdits(${draft.id})">♻️ Save Edits</button>
             <input  type="text" id="reject-note-${draft.id}" placeholder="Reject reason (optional)" style="flex:1;min-width:180px">
             <button class="btn btn-danger"  onclick="rejectDraft(${draft.id})">❌ Reject</button>
@@ -334,12 +338,12 @@ function toggleExp(id) {
   header.querySelector('.chevron').style.transform = body.classList.contains('open') ? 'rotate(180deg)' : '';
 }
 
-async function approveDraft(id) {
+async function approveDraft(id, force_immediate) {
   const body = document.getElementById('draft-body-' + id).value;
   const msgEl = document.getElementById('approval-msg-' + id);
   try {
-    await api('POST', `/approvals/${id}/approve`, { body });
-    toast('Approved!');
+    await api('POST', `/approvals/${id}/approve`, { body, force_immediate });
+    toast(force_immediate ? '⚡ Sent immediately!' : '✅ Approved!');
     approvals();
   } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
 }
