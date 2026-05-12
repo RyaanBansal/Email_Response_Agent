@@ -207,6 +207,7 @@ Rules:
 - Do NOT include a subject line.
 - End with "Best regards,\nSupport Team".
 - Do NOT add placeholder text like [Your Name].
+- Only generate the email body — do NOT include any preamble or commentary.
 - Output the marker {_DRAFT_DELIMITER} on its own line, then immediately write the email. Nothing after the email.
 
 Client: {sender}
