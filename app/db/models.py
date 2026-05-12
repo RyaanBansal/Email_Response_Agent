@@ -28,13 +28,46 @@ def get_email_by_uid(uid: str) -> dict | None:
 
 
 def count_emails_by_sender(sender: str) -> int:
+    """Total number of emails received from this sender (all query types)."""
     res = _db().table("emails").select("id", count="exact").eq("sender", sender).execute()
+    return res.count or 0
+
+
+def count_emails_by_sender_and_query(sender: str, query_type: str,
+                                     exclude_email_id: int | None = None) -> int:
+    """
+    Count prior emails from `sender` that share the same `query_type`.
+
+    Used by run_pipeline to decide whether the current email is a repeat of the
+    same issue (same sender + same query type) and should go to the manual queue.
+
+    `exclude_email_id` should be the id of the email currently being processed
+    so it is not counted against itself.
+    """
+    q = (
+        _db().table("emails")
+        .select("id", count="exact")
+        .eq("sender", sender)
+        .eq("query_type", query_type)
+    )
+    if exclude_email_id is not None:
+        q = q.neq("id", exclude_email_id)
+    res = q.execute()
     return res.count or 0
 
 
 def insert_email(uid: str, sender: str, subject: str, body: str,
                  is_repeat: bool, sender_count: int) -> dict | None:
-    status = "manual" if is_repeat else "pending"
+    """
+    Insert a new inbound email.
+
+    The initial status is always "pending" — the poller does not yet know the
+    query type so it cannot make the repeat-same-query decision.  run_pipeline
+    classifies the email first and then re-routes to "manual" when needed.
+
+    `is_repeat` and `sender_count` are retained for informational display in
+    the UI (e.g. "Email #3 from this sender") but no longer drive routing.
+    """
     res = _db().table("emails").insert({
         "uid":          uid,
         "sender":       sender,
@@ -43,7 +76,7 @@ def insert_email(uid: str, sender: str, subject: str, body: str,
         "received_at":  utcnow(),
         "is_repeat":    is_repeat,
         "sender_count": sender_count,
-        "status":       status,
+        "status":       "pending",
     }).execute()
     return res.data[0] if res.data else None
 
@@ -273,3 +306,53 @@ def get_scheduled_drafts() -> list[dict]:
         .execute()
     )
     return res.data or []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# custom_query_types table  (added by supabase_migration_v2.sql)
+#
+# Columns:  id SERIAL PK | name VARCHAR UNIQUE | keywords TEXT | created_at TIMESTAMPTZ
+#
+# `keywords` stores a comma-separated list of plain words/phrases that are
+# converted to word-boundary regex patterns by the keyword classifier.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_custom_query_types() -> list[dict]:
+    """Return all custom query type rows ordered by name."""
+    try:
+        res = _db().table("custom_query_types").select("*").order("name").execute()
+        return res.data or []
+    except Exception as exc:
+        logger.warning(f"get_custom_query_types error: {exc}")
+        return []
+
+
+def upsert_custom_query_type(name: str, keywords: str) -> dict | None:
+    """
+    Insert or update a custom query type.
+    `name` is lowercased and used as the unique key.
+    `keywords` is a comma-separated string of plain words/phrases.
+    Returns the upserted row or None on failure.
+    """
+    name = name.strip().lower()
+    try:
+        res = _db().table("custom_query_types").upsert({
+            "name":       name,
+            "keywords":   keywords.strip(),
+            "created_at": utcnow(),
+        }, on_conflict="name").execute()
+        return res.data[0] if res.data else None
+    except Exception as exc:
+        logger.error(f"upsert_custom_query_type({name!r}) error: {exc}")
+        return None
+
+
+def delete_custom_query_type(name: str) -> bool:
+    """Delete a custom query type by name. Returns True on success."""
+    name = name.strip().lower()
+    try:
+        _db().table("custom_query_types").delete().eq("name", name).execute()
+        return True
+    except Exception as exc:
+        logger.error(f"delete_custom_query_type({name!r}) error: {exc}")
+        return False
