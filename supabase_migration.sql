@@ -53,6 +53,18 @@ INSERT INTO app_settings (key, value, is_secret) VALUES
     ('GEMINI_MODEL',          '',    FALSE)
 ON CONFLICT (key) DO NOTHING;
 
+CREATE TABLE IF NOT EXISTS custom_query_types (
+    id         SERIAL PRIMARY KEY,
+    name       VARCHAR(128) UNIQUE NOT NULL,  -- lowercased, e.g. "warranty"
+    keywords   TEXT DEFAULT '',               -- comma-separated hint words
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+COMMENT ON TABLE  custom_query_types          IS 'User-defined email query categories with optional keyword hints for the fallback classifier.';
+COMMENT ON COLUMN custom_query_types.keywords IS 'Comma-separated plain words/phrases. Each is converted to a \\bword\\b regex pattern by the classifier.';
+
+CREATE INDEX IF NOT EXISTS idx_custom_query_types_name ON custom_query_types(name);
+
 
 -- ── 4. Row-Level Security ─────────────────────────────────────────────────────
 -- Enable RLS on all tables so that only authenticated admin users
@@ -153,6 +165,26 @@ BEGIN
   ) THEN
     CREATE POLICY auth_users_all
     ON public.app_settings
+    FOR ALL
+    TO authenticated
+    USING (true)
+    WITH CHECK (true);
+  END IF;
+END $$;
+
+ALTER TABLE custom_query_types ENABLE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_policies
+    WHERE schemaname = 'public'
+      AND tablename  = 'custom_query_types'
+      AND policyname = 'auth_users_all'
+  ) THEN
+    CREATE POLICY auth_users_all
+    ON public.custom_query_types
     FOR ALL
     TO authenticated
     USING (true)
