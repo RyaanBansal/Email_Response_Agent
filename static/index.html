@@ -96,6 +96,13 @@
   .alert-error   { background: rgba(224,82,99,.15); border: 1px solid rgba(224,82,99,.3); color: var(--danger); }
   .alert-info    { background: rgba(79,142,247,.12); border: 1px solid rgba(79,142,247,.3); color: var(--accent); }
 
+  /* Query type pills */
+  .qt-list { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+  .qt-pill { display: inline-flex; align-items: center; gap: 6px; background: var(--surface2); border: 1px solid var(--border); border-radius: 20px; padding: 4px 12px; font-size: 12px; }
+  .qt-pill.builtin { border-color: rgba(79,142,247,.4); color: var(--accent); }
+  .qt-pill.custom  { border-color: rgba(76,175,134,.4); color: var(--success); }
+  .qt-pill .del-btn { background: none; border: none; color: var(--danger); cursor: pointer; padding: 0; font-size: 13px; line-height: 1; }
+
   /* Misc */
   h1 { font-size: 24px; font-weight: 700; margin-bottom: 24px; }
   h2 { font-size: 18px; font-weight: 600; margin: 20px 0 12px; }
@@ -111,6 +118,7 @@
   .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; margin-right: 6px; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .loading { color: var(--muted); padding: 40px; text-align: center; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -160,6 +168,8 @@
 // ── State ────────────────────────────────────────────────────────────────────
 let currentPage = 'dashboard';
 let currentUser = null;
+// Cache of all query type names for the template create form
+let _queryTypeCache = [];
 
 // ── API ──────────────────────────────────────────────────────────────────────
 async function api(method, path, body) {
@@ -378,25 +388,66 @@ async function manualQueue() {
     c.innerHTML = '<h1>Manual Queue</h1><div class="alert alert-success">Manual queue is empty.</div>';
     return;
   }
-  c.innerHTML = '<h1>Manual Queue — Repeat Senders</h1>' +
-    data.map(em => `
+  c.innerHTML = '<h1>Manual Queue — Repeat Senders</h1>'
+    + '<p class="muted" style="margin-bottom:16px">These emails were held because the sender has contacted you frequently. You can send a manual reply directly, or generate an AI draft for review in Pending Approvals.</p>'
+    + data.map(em => `
     <div class="expander" id="mexp-${em.id}">
       <div class="expander-header" onclick="toggleMExp(${em.id})">
-        <span>🔁 <strong>${em.sender}</strong> &nbsp;|&nbsp; ${em.subject||''} &nbsp;|&nbsp; Email #${em.sender_count||1} from this sender</span>
-        <span class="chevron" style="transform:rotate(180deg)">▼</span>
+        <span>🔁 <strong>${esc(em.sender)}</strong> &nbsp;|&nbsp; ${esc(em.subject||'(no subject)')} &nbsp;|&nbsp; Email #${em.sender_count||1} from this sender &nbsp;|&nbsp; <span class="muted">${(em.received_at||'').slice(0,16).replace('T',' ')}</span></span>
+        <span class="chevron" id="mchev-${em.id}" style="transform:rotate(180deg)">▼</span>
       </div>
       <div class="expander-body open" id="mexp-body-${em.id}">
-        <p style="white-space:pre-wrap;margin-bottom:10px">${esc(em.body||'')}</p>
-        <p class="muted" style="margin-bottom:14px">Received: ${(em.received_at||'').slice(0,16).replace('T',' ')}</p>
-        <button class="btn btn-primary btn-sm" onclick="generateManual(${em.id})">Generate Draft Anyway</button>
+
+        <!-- Original email -->
+        <label>Original Message</label>
+        <textarea rows="6" disabled style="opacity:.7;margin-bottom:14px">${esc(em.body||'')}</textarea>
+
+        <!-- Manual reply section -->
+        <label>✍️ Type a Manual Reply</label>
+        <textarea rows="6" id="mreply-${em.id}" placeholder="Write your reply here…"></textarea>
+        <div class="row" style="margin-top:10px">
+          <button class="btn btn-primary btn-sm" onclick="sendManualReply(${em.id})">📤 Send Reply</button>
+          <button class="btn btn-ghost btn-sm"   onclick="clearManualReply(${em.id})">✕ Clear</button>
+        </div>
+        <div id="mreply-msg-${em.id}" style="margin-top:8px"></div>
+
+        <hr style="border:none;border-top:1px solid var(--border);margin:18px 0">
+
+        <!-- AI generate section -->
+        <p class="muted" style="margin-bottom:8px">Or let the AI draft a response for review:</p>
+        <button class="btn btn-ghost btn-sm" onclick="generateManual(${em.id})">🤖 Generate AI Draft</button>
         <div id="mq-msg-${em.id}" style="margin-top:8px"></div>
+
       </div>
     </div>`).join('');
 }
 
 function toggleMExp(id) {
-  const body = document.getElementById('mexp-body-' + id);
-  body.classList.toggle('open');
+  const body  = document.getElementById('mexp-body-' + id);
+  const chev  = document.getElementById('mchev-' + id);
+  const open  = body.classList.toggle('open');
+  chev.style.transform = open ? 'rotate(180deg)' : '';
+}
+
+function clearManualReply(id) {
+  document.getElementById('mreply-' + id).value = '';
+}
+
+async function sendManualReply(id) {
+  const body   = document.getElementById('mreply-' + id).value.trim();
+  const msgEl  = document.getElementById('mreply-msg-' + id);
+  if (!body) {
+    msgEl.innerHTML = '<div class="alert alert-error">Reply cannot be empty.</div>';
+    return;
+  }
+  msgEl.innerHTML = '<span class="spinner"></span> Sending…';
+  try {
+    await api('POST', `/manual/${id}/reply`, { body });
+    toast('✅ Manual reply sent!');
+    manualQueue();
+  } catch(e) {
+    msgEl.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
 }
 
 async function generateManual(id) {
@@ -441,14 +492,23 @@ async function sentEmails() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// TEMPLATES
+// TEMPLATES  (with custom query type management)
 // ══════════════════════════════════════════════════════════════════════════════
 async function templates() {
-  const data = await api('GET', '/templates');
-  if (!data) return;
+  // Load both templates and query types in parallel
+  const [tmplData, qtData] = await Promise.all([
+    api('GET', '/templates'),
+    api('GET', '/templates/query-types'),
+  ]);
+  if (!tmplData || !qtData) return;
+
+  // Cache for use in the create form
+  _queryTypeCache = qtData.map(q => q.name);
+
   const c = document.getElementById('page-content');
 
-  const tmplHtml = data.map(t => {
+  // ── Existing templates ────────────────────────────────────────────────────
+  const tmplHtml = tmplData.map(t => {
     const delay = t.send_delay_seconds || 0;
     let initUnit = 'Minutes', initVal = 0;
     if (delay >= 86400 && delay % 86400 === 0) { initUnit = 'Days'; initVal = delay / 86400; }
@@ -490,19 +550,63 @@ async function templates() {
     </div>`;
   }).join('');
 
+  // ── Query type pills ──────────────────────────────────────────────────────
+  const pillsHtml = qtData.map(q => {
+    const cls = q.is_builtin ? 'builtin' : 'custom';
+    const icon = q.is_builtin ? '🔒' : '✏️';
+    const delBtn = !q.is_builtin
+      ? `<button class="del-btn" title="Delete" onclick="deleteQueryType('${esc(q.name)}')">✕</button>`
+      : '';
+    const kw = q.keywords ? `<span style="opacity:.6;font-size:10px"> · ${q.keywords.split(',').slice(0,3).join(', ')}${q.keywords.split(',').length>3?'…':''}</span>` : '';
+    return `<span class="qt-pill ${cls}">${icon} ${esc(q.name)}${kw}${delBtn}</span>`;
+  }).join('');
+
   c.innerHTML = `
     <h1>Response Templates</h1>
     <p class="muted" style="margin-bottom:16px">Use <code>{{ai_response}}</code> and <code>{{customer_name}}</code> as placeholders.</p>
     ${tmplHtml}
+
     <hr class="divider">
+
+    <!-- ── Query Type Manager ── -->
+    <h2>📂 Query Type Manager</h2>
+    <p class="muted" style="margin-bottom:12px">
+      🔒 Built-in types cannot be deleted. ✏️ Custom types are user-defined.<br>
+      You can add keywords to any type to improve the AI keyword-fallback classifier.
+    </p>
+
+    <div class="qt-list" id="qt-pill-list">${pillsHtml}</div>
+
+    <div class="card" style="margin-top:16px">
+      <h2 style="margin-top:0;margin-bottom:14px;font-size:15px">Add / Update Query Type</h2>
+      <div class="two-col">
+        <div>
+          <label>Query Type Name</label>
+          <input type="text" id="qt-name" placeholder="e.g. warranty, partnership, shipping…">
+          <p class="hint">Lowercase letters, numbers and hyphens only. Built-in names are allowed (to add keywords).</p>
+        </div>
+        <div>
+          <label>Keywords (optional)</label>
+          <input type="text" id="qt-keywords" placeholder="e.g. warranty, broken, defective, replacement">
+          <p class="hint">Comma-separated words/phrases. Used as fallback if AI classification fails.</p>
+        </div>
+      </div>
+      <div id="qt-msg" style="margin-top:8px"></div>
+      <button class="btn btn-primary btn-sm" style="margin-top:14px" onclick="saveQueryType()">💾 Save Query Type</button>
+    </div>
+
+    <hr class="divider">
+
+    <!-- ── Add New Template ── -->
     <h2>Add New Template</h2>
     <div class="card">
       <label>Name (unique)</label><input type="text" id="n-name">
       <label>Query Type</label>
-      <select id="n-type">
-        <option>billing</option><option>technical</option><option>general</option>
-        <option>complaint</option><option>refund</option><option>onboarding</option>
-      </select>
+      <input type="text" id="n-type" placeholder="Type or choose — e.g. billing, warranty…" list="qt-datalist">
+      <datalist id="qt-datalist">
+        ${_queryTypeCache.map(n => `<option value="${esc(n)}">`).join('')}
+      </datalist>
+      <p class="hint">Type a query type name. All types (built-in + custom) are suggested.</p>
       <label>Subject Line</label><input type="text" id="n-subj">
       <label>Body</label><textarea rows="5" id="n-body"></textarea>
       <label style="margin-top:14px">Send Delay After Approval</label>
@@ -535,8 +639,8 @@ async function saveTemplate(id) {
 }
 
 async function createTemplate() {
-  const name = document.getElementById('n-name').value;
-  const query_type = document.getElementById('n-type').value;
+  const name = document.getElementById('n-name').value.trim();
+  const query_type = document.getElementById('n-type').value.trim().toLowerCase();
   const subject = document.getElementById('n-subj').value;
   const body = document.getElementById('n-body').value;
   const val = parseInt(document.getElementById('n-dv').value) || 0;
@@ -544,11 +648,55 @@ async function createTemplate() {
   const mult = { Minutes: 60, Hours: 3600, Days: 86400 }[unit];
   const delay = val > 0 ? val * mult : null;
   const msgEl = document.getElementById('new-tmpl-msg');
+
+  if (!name || !query_type) {
+    msgEl.innerHTML = '<div class="alert alert-error">Template name and query type are required.</div>';
+    return;
+  }
+
   try {
     await api('POST', '/templates', { name, query_type, subject, body, send_delay_seconds: delay });
     toast('Template created!');
     templates();
   } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+}
+
+// ── Query Type CRUD helpers ───────────────────────────────────────────────────
+async function saveQueryType() {
+  const name     = document.getElementById('qt-name').value.trim().toLowerCase();
+  const keywords = document.getElementById('qt-keywords').value.trim();
+  const msgEl    = document.getElementById('qt-msg');
+
+  if (!name) {
+    msgEl.innerHTML = '<div class="alert alert-error">Query type name cannot be empty.</div>';
+    return;
+  }
+  if (!/^[a-z0-9_-]+$/.test(name)) {
+    msgEl.innerHTML = '<div class="alert alert-error">Use only lowercase letters, numbers, hyphens or underscores.</div>';
+    return;
+  }
+
+  try {
+    await api('POST', '/templates/query-types', { name, keywords });
+    toast(`Query type "${name}" saved!`);
+    // Clear inputs and reload
+    document.getElementById('qt-name').value = '';
+    document.getElementById('qt-keywords').value = '';
+    templates();
+  } catch(e) {
+    msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`;
+  }
+}
+
+async function deleteQueryType(name) {
+  if (!confirm(`Delete custom query type "${name}"?\n\nThis removes it from the classifier and suggestion list but does NOT delete templates that already use it.`)) return;
+  try {
+    await api('DELETE', `/templates/query-types/${encodeURIComponent(name)}`);
+    toast(`Query type "${name}" deleted.`, 'warn');
+    templates();
+  } catch(e) {
+    toast(e.message, 'error');
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -608,8 +756,9 @@ async function settings() {
           <div><label>Poll Interval (seconds)</label><input type="number" id="s-POLL_INTERVAL_SECONDS" value="${data.POLL_INTERVAL_SECONDS||60}" min="10" max="86400"></div>
           <div><label>Max Repeat Count (before manual queue)</label><input type="number" id="s-MAX_REPEAT_COUNT" value="${data.MAX_REPEAT_COUNT||3}" min="1"></div>
         </div>
-        <label>Gemini Model</label>
+        <label>Primary Gemini Model</label>
         <input type="text" id="s-GEMINI_MODEL" value="${esc(data.GEMINI_MODEL||'gemma-4-31b-it')}">
+        <p class="hint">Primary model for AI classification and draft generation. The system automatically falls back to <code>gemma-4-26b-a4b-it</code>, then <code>gemini-2.0-flash</code>, and finally keyword-only classification if all models are unavailable.</p>
       </div>
     </div>
 
