@@ -2,17 +2,27 @@ services:
   - type: web
     name: email-agent-admin
     env: python
-    region: oregon          # change to your preferred region
-    plan: starter           # free tier; upgrade to 'standard' for always-on
+    region: oregon
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /api/auth/me
+    # FIX P6: was /api/auth/me which returns 401 without a cookie —
+    # the health checker never sends cookies so the service appeared unhealthy.
+    healthCheckPath: /healthz
     envVars:
       - key: SUPABASE_URL
-        sync: false         # fill in Render dashboard → Environment
+        sync: false
       - key: SUPABASE_ANON_KEY
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # FIX P0: JWT secret for signature verification.
+      # Find it in: Supabase Dashboard → Project Settings → API → JWT Secret
+      - key: SUPABASE_JWT_PUBLIC_KEY
+        sync: false
+      # FIX P0: Comma-separated list of emails allowed to access admin UI.
+      # Example: alice@example.com,bob@example.com
+      - key: ADMIN_EMAILS
         sync: false
       - key: GEMINI_API_KEY
         sync: false
@@ -38,3 +48,7 @@ services:
         value: gemma-4-31b-it
       - key: PYTHON_VERSION
         value: "3.11.0"
+      # FIX P2: Set to "false" on every replica except one when running
+      # multiple uvicorn workers to prevent duplicate scheduled sends.
+      - key: SCHEDULER_ENABLED
+        value: "true"
