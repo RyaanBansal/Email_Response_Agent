@@ -1,17 +1,15 @@
-"""
-app/db/database.py  –  Supabase client (mirrors your existing database.py pattern)
-All DB operations go through get_supabase_admin_client() for backend use.
-"""
 import os
 import jwt
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from datetime import timedelta
 
 load_dotenv()
 
 SUPABASE_URL         = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY    = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_JWT_PUBLIC_KEY = os.getenv("SUPABASE_JWT_PUBLIC_KEY", "")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError(
@@ -19,9 +17,16 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in your .env file."
     )
 
+if not SUPABASE_JWT_PUBLIC_KEY:
+    import warnings
+    warnings.warn(
+        "SUPABASE_JWT_PUBLIC_KEY is not set. JWT signatures will NOT be "
+        "verified — set this variable before deploying to production.",
+        stacklevel=1,
+    )
+
 
 def get_supabase_client(jwt_token: str | None = None) -> Client:
-    """Get a Supabase client with optional JWT auth (respects RLS)."""
     client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
     if jwt_token:
         client.postgrest.auth(jwt_token)
@@ -29,13 +34,38 @@ def get_supabase_client(jwt_token: str | None = None) -> Client:
 
 
 def get_supabase_admin_client() -> Client:
-    """Get a Supabase admin client — bypasses RLS. Used for all pipeline operations."""
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
 def verify_jwt(jwt_token: str) -> dict | None:
-    """Verify JWT token and return decoded payload (no signature check — Supabase handles that)."""
+    if not jwt_token:
+        return None
     try:
-        return jwt.decode(jwt_token, options={"verify_signature": False})
+        if SUPABASE_JWT_PUBLIC_KEY:
+            return jwt.decode(
+                jwt_token,
+                SUPABASE_JWT_PUBLIC_KEY,
+                algorithms=["ES256"],
+                options={"require": ["exp", "sub"]},
+                leeway=timedelta(seconds=30),
+                audience="authenticated"
+            )
+        else:
+            import warnings
+            warnings.warn(
+                "JWT decoded WITHOUT signature verification. "
+                "Set SUPABASE_JWT_PUBLIC_KEY before deploying.",
+                stacklevel=2,
+            )
+            return jwt.decode(
+                jwt_token,
+                options={"verify_signature": False, "require": ["exp"]},
+                algorithms=["ES256"],
+            )
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError as e:
+        print(f"JWT error: {e}")
+        return None
     except Exception:
         return None
