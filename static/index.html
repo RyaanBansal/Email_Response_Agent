@@ -76,7 +76,6 @@
   .expander-body { background: var(--bg); padding: 18px; display: none; border-top: 1px solid var(--border); }
   .expander-body.open { display: block; }
   .chevron { transition: transform .2s; font-size: 12px; color: var(--muted); }
-  .open .chevron { transform: rotate(180deg); }
 
   /* Metrics */
   .metrics { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; margin-bottom: 28px; }
@@ -168,8 +167,29 @@
 // ── State ────────────────────────────────────────────────────────────────────
 let currentPage = 'dashboard';
 let currentUser = null;
-// Cache of all query type names for the template create form
 let _queryTypeCache = [];
+
+// ── Security: HTML escaping ───────────────────────────────────────────────────
+// IMPORTANT: Every value that originates from user-controlled data (email
+// addresses, subjects, bodies, log details, template content, etc.) MUST be
+// passed through esc() before being interpolated into an innerHTML string.
+// Never bypass this with a cast or a comment; if a value can come from the
+// network it must be escaped.
+function esc(s) {
+  if (s === null || s === undefined) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+}
+
+// Safe DOM text setter — avoids innerHTML for single text nodes.
+function setText(el, value) {
+  if (typeof el === 'string') el = document.getElementById(el);
+  if (el) el.textContent = value;
+}
 
 // ── API ──────────────────────────────────────────────────────────────────────
 async function api(method, path, body) {
@@ -188,6 +208,7 @@ function toast(msg, type='success') {
   el.className = 'toast-item';
   el.style.background = type === 'success' ? 'rgba(76,175,134,.9)' : type === 'error' ? 'rgba(224,82,99,.9)' : 'rgba(79,142,247,.9)';
   el.style.color = type === 'warn' ? '#000' : '#fff';
+  // Use textContent — toast messages are developer-controlled strings only
   el.textContent = msg;
   document.getElementById('toast').appendChild(el);
   setTimeout(() => el.remove(), 3500);
@@ -208,7 +229,8 @@ function showAuth() {
 function showApp() {
   document.getElementById('auth-screen').style.display = 'none';
   document.getElementById('app').style.display = 'flex';
-  document.getElementById('sidebar-user').textContent = currentUser?.email || '';
+  // Use textContent — never innerHTML — for user-supplied email address
+  setText('sidebar-user', currentUser?.email || '');
   navigate('dashboard');
 }
 
@@ -224,7 +246,9 @@ async function doLogin() {
     });
     if (user) { currentUser = { email: user.user_email }; showApp(); }
   } catch(e) {
-    errEl.textContent = e.message; errEl.style.display = 'block';
+    // Use textContent to display the error message safely
+    errEl.textContent = e.message;
+    errEl.style.display = 'block';
   } finally { btn.disabled = false; btn.textContent = 'Sign In'; }
 }
 
@@ -259,6 +283,28 @@ async function pollNow() {
   } catch(e) { toast(e.message, 'error'); }
 }
 
+// ── DOM builder helpers ──────────────────────────────────────────────────────
+// These create elements via the DOM API (not innerHTML) for any slot that
+// contains untrusted data.  innerHTML is only used for static chrome where
+// every interpolated value has been passed through esc().
+
+function makeTextarea(id, value, rows, disabled) {
+  const ta = document.createElement('textarea');
+  ta.id = id;
+  ta.rows = rows || 6;
+  ta.value = value || '';
+  if (disabled) { ta.disabled = true; ta.style.opacity = '0.7'; }
+  return ta;
+}
+
+function makeInput(id, value, type) {
+  const inp = document.createElement('input');
+  inp.type = type || 'text';
+  inp.id = id;
+  inp.value = value || '';
+  return inp;
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // DASHBOARD
 // ══════════════════════════════════════════════════════════════════════════════
@@ -266,28 +312,57 @@ async function dashboard() {
   const data = await api('GET', '/dashboard');
   if (!data) return;
   const c = document.getElementById('page-content');
+
+  // Metrics are numeric — safe to interpolate directly
   c.innerHTML = `
     <h1>Dashboard</h1>
     <div class="metrics">
-      <div class="metric"><div class="label">📥 Received Today</div><div class="value">${data.received_today}</div></div>
-      <div class="metric"><div class="label">⏳ Pending</div><div class="value">${data.pending}</div></div>
-      <div class="metric"><div class="label">⏰ Scheduled</div><div class="value">${data.approved}</div></div>
-      <div class="metric"><div class="label">✅ Sent</div><div class="value">${data.sent}</div></div>
-      <div class="metric"><div class="label">🔁 Manual Queue</div><div class="value">${data.manual_queue}</div></div>
-      <div class="metric"><div class="label">⏱ Avg Response (min)</div><div class="value">${data.avg_response_min}</div></div>
+      <div class="metric"><div class="label">📥 Received Today</div><div class="value">${parseInt(data.received_today)||0}</div></div>
+      <div class="metric"><div class="label">⏳ Pending</div><div class="value">${parseInt(data.pending)||0}</div></div>
+      <div class="metric"><div class="label">⏰ Scheduled</div><div class="value">${parseInt(data.approved)||0}</div></div>
+      <div class="metric"><div class="label">✅ Sent</div><div class="value">${parseInt(data.sent)||0}</div></div>
+      <div class="metric"><div class="label">🔁 Manual Queue</div><div class="value">${parseInt(data.manual_queue)||0}</div></div>
+      <div class="metric"><div class="label">⏱ Avg Response (min)</div><div class="value">${parseFloat(data.avg_response_min)||0}</div></div>
     </div>
     <hr class="divider">
     <h2>Recent Activity</h2>
-    ${data.recent_activity.length ? `
-    <div class="card" style="padding:0;overflow:hidden">
-      <table>
-        <thead><tr><th>Time</th><th>Action</th><th>Detail</th></tr></thead>
-        <tbody>
-          ${data.recent_activity.map(r => `<tr><td class="muted">${r.time}</td><td>${r.action}</td><td>${r.detail}</td></tr>`).join('')}
-        </tbody>
-      </table>
-    </div>` : '<div class="alert alert-info">No activity yet. Click Poll to fetch emails.</div>'}
+    <div id="activity-container"></div>
   `;
+
+  // Build activity table via DOM to avoid XSS from log detail/action fields
+  const container = document.getElementById('activity-container');
+  if (!data.recent_activity || !data.recent_activity.length) {
+    container.innerHTML = '<div class="alert alert-info">No activity yet. Click Poll to fetch emails.</div>';
+    return;
+  }
+
+  const wrapper = document.createElement('div');
+  wrapper.className = 'card';
+  wrapper.style.cssText = 'padding:0;overflow:hidden';
+
+  const table = document.createElement('table');
+  table.innerHTML = '<thead><tr><th>Time</th><th>Action</th><th>Detail</th></tr></thead>';
+  const tbody = document.createElement('tbody');
+
+  for (const r of data.recent_activity) {
+    const tr = document.createElement('tr');
+    const tdTime = document.createElement('td');
+    tdTime.className = 'muted';
+    tdTime.textContent = r.time || '';
+
+    const tdAction = document.createElement('td');
+    tdAction.textContent = r.action || '';
+
+    const tdDetail = document.createElement('td');
+    tdDetail.textContent = r.detail || '';
+
+    tr.append(tdTime, tdAction, tdDetail);
+    tbody.appendChild(tr);
+  }
+
+  table.appendChild(tbody);
+  wrapper.appendChild(table);
+  container.appendChild(wrapper);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -297,84 +372,182 @@ async function approvals() {
   const data = await api('GET', '/approvals');
   if (!data) return;
   const c = document.getElementById('page-content');
+
   if (!data.length) {
     c.innerHTML = '<h1>Pending Approvals</h1><div class="alert alert-success">All caught up — no drafts waiting.</div>';
     return;
   }
-  c.innerHTML = `<h1>Pending Approvals</h1><p style="margin-bottom:16px;color:var(--muted)">${data.length} draft(s) awaiting review</p>` +
-    data.map(item => {
-      const { draft, email, delay_badge } = item;
-      const conf = Math.round((draft.confidence || 0) * 100);
-      const badge = delay_badge ? `<span class="badge">⏰ ${delay_badge}</span>` : '';
-      const body = draft.edited_body || draft.draft_body || '';
-      return `
-      <div class="expander" id="exp-${draft.id}">
-        <div class="expander-header" onclick="toggleExp(${draft.id})">
-          <span>📧 <strong>${email.sender}</strong> &nbsp;|&nbsp; ${email.subject || '(no subject)'} &nbsp;|&nbsp; Type: ${email.query_type || 'unknown'} &nbsp;|&nbsp; ${conf}% confidence ${badge}</span>
-          <span class="chevron">▼</span>
-        </div>
-        <div class="expander-body open" id="exp-body-${draft.id}">
-          <div class="two-col">
-            <div>
-              <label>Original Email</label>
-              <textarea rows="8" disabled style="opacity:.7">${esc(email.body || '')}</textarea>
-              <p class="muted" style="margin-top:6px">Received: ${(email.received_at||'').slice(0,16).replace('T',' ')}</p>
-            </div>
-            <div>
-              <label>AI Draft Response (editable)</label>
-              <textarea rows="8" id="draft-body-${draft.id}">${esc(body)}</textarea>
-            </div>
-          </div>
-          <div class="row" style="margin-top:14px">
-            ${delay_badge
-              ? `<button class="btn btn-primary" onclick="approveDraft(${draft.id}, false)">⏰ Approve & Schedule (${delay_badge})</button>
-                 <button class="btn btn-success"  onclick="approveDraft(${draft.id}, true)" style="background:var(--success)">⚡ Send Immediately</button>`
-              : `<button class="btn btn-primary" onclick="approveDraft(${draft.id}, false)">✅ Approve & Send</button>`
-            }
-            <button class="btn btn-ghost"   onclick="saveEdits(${draft.id})">♻️ Save Edits</button>
-            <input  type="text" id="reject-note-${draft.id}" placeholder="Reject reason (optional)" style="flex:1;min-width:180px">
-            <button class="btn btn-danger"  onclick="rejectDraft(${draft.id})">❌ Reject</button>
-          </div>
-          <div id="approval-msg-${draft.id}"></div>
-        </div>
-      </div>`;
-    }).join('');
+
+  c.innerHTML = `<h1>Pending Approvals</h1><p style="margin-bottom:16px;color:var(--muted)">${data.length} draft(s) awaiting review</p><div id="approvals-list"></div>`;
+  const list = document.getElementById('approvals-list');
+
+  for (const item of data) {
+    const { draft, email, delay_badge } = item;
+    const conf = Math.round((draft.confidence || 0) * 100);
+    const body = draft.edited_body || draft.draft_body || '';
+
+    // ── Outer expander shell (static chrome — no user data here) ─────────
+    const expander = document.createElement('div');
+    expander.className = 'expander';
+    expander.id = `exp-${draft.id}`;
+
+    // ── Header — user-controlled fields go in via textContent ─────────────
+    const header = document.createElement('div');
+    header.className = 'expander-header';
+    header.onclick = () => toggleExp(draft.id);
+
+    const headerLeft = document.createElement('span');
+    // Build header text safely
+    const senderStrong = document.createElement('strong');
+    senderStrong.textContent = email.sender;
+    headerLeft.appendChild(document.createTextNode('📧 '));
+    headerLeft.appendChild(senderStrong);
+    headerLeft.appendChild(document.createTextNode(` | ${esc(email.subject || '(no subject)')} | Type: ${esc(email.query_type || 'unknown')} | ${conf}% confidence`));
+    if (delay_badge) {
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = `⏰ ${delay_badge}`;
+      headerLeft.appendChild(badge);
+    }
+
+    const chevron = document.createElement('span');
+    chevron.className = 'chevron';
+    chevron.id = `chev-${draft.id}`;
+    chevron.textContent = '▼';
+    chevron.style.transform = 'rotate(180deg)';
+
+    header.append(headerLeft, chevron);
+
+    // ── Body ──────────────────────────────────────────────────────────────
+    const bodyDiv = document.createElement('div');
+    bodyDiv.className = 'expander-body open';
+    bodyDiv.id = `exp-body-${draft.id}`;
+
+    // Two-column layout
+    const twocol = document.createElement('div');
+    twocol.className = 'two-col';
+
+    const leftCol = document.createElement('div');
+    const leftLabel = document.createElement('label');
+    leftLabel.textContent = 'Original Email';
+    const origTa = makeTextarea(`orig-${draft.id}`, email.body || '', 8, true);
+    const receivedP = document.createElement('p');
+    receivedP.className = 'muted';
+    receivedP.style.marginTop = '6px';
+    receivedP.textContent = `Received: ${(email.received_at || '').slice(0, 16).replace('T', ' ')}`;
+    leftCol.append(leftLabel, origTa, receivedP);
+
+    const rightCol = document.createElement('div');
+    const rightLabel = document.createElement('label');
+    rightLabel.textContent = 'AI Draft Response (editable)';
+    const draftTa = makeTextarea(`draft-body-${draft.id}`, body, 8, false);
+    rightCol.append(rightLabel, draftTa);
+
+    twocol.append(leftCol, rightCol);
+
+    // Action row
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.style.marginTop = '14px';
+
+    if (delay_badge) {
+      const btnSchedule = document.createElement('button');
+      btnSchedule.className = 'btn btn-primary';
+      btnSchedule.textContent = `⏰ Approve & Schedule (${delay_badge})`;
+      btnSchedule.onclick = () => approveDraft(draft.id, false);
+
+      const btnImmediate = document.createElement('button');
+      btnImmediate.className = 'btn btn-success';
+      btnImmediate.style.background = 'var(--success)';
+      btnImmediate.textContent = '⚡ Send Immediately';
+      btnImmediate.onclick = () => approveDraft(draft.id, true);
+
+      row.append(btnSchedule, btnImmediate);
+    } else {
+      const btnApprove = document.createElement('button');
+      btnApprove.className = 'btn btn-primary';
+      btnApprove.textContent = '✅ Approve & Send';
+      btnApprove.onclick = () => approveDraft(draft.id, false);
+      row.appendChild(btnApprove);
+    }
+
+    const btnSave = document.createElement('button');
+    btnSave.className = 'btn btn-ghost';
+    btnSave.textContent = '♻️ Save Edits';
+    btnSave.onclick = () => saveEdits(draft.id);
+
+    const rejectInput = makeInput(`reject-note-${draft.id}`, '', 'text');
+    rejectInput.placeholder = 'Reject reason (optional)';
+    rejectInput.style.cssText = 'flex:1;min-width:180px';
+
+    const btnReject = document.createElement('button');
+    btnReject.className = 'btn btn-danger';
+    btnReject.textContent = '❌ Reject';
+    btnReject.onclick = () => rejectDraft(draft.id);
+
+    row.append(btnSave, rejectInput, btnReject);
+
+    const msgDiv = document.createElement('div');
+    msgDiv.id = `approval-msg-${draft.id}`;
+
+    bodyDiv.append(twocol, row, msgDiv);
+    expander.append(header, bodyDiv);
+    list.appendChild(expander);
+  }
 }
 
 function toggleExp(id) {
-  const body = document.getElementById('exp-body-' + id);
-  const header = body.previousElementSibling;
-  body.classList.toggle('open');
-  header.querySelector('.chevron').style.transform = body.classList.contains('open') ? 'rotate(180deg)' : '';
+  const body = document.getElementById(`exp-body-${id}`);
+  const chev = document.getElementById(`chev-${id}`);
+  const open = body.classList.toggle('open');
+  if (chev) chev.style.transform = open ? 'rotate(180deg)' : '';
 }
 
 async function approveDraft(id, force_immediate) {
-  const body = document.getElementById('draft-body-' + id).value;
-  const msgEl = document.getElementById('approval-msg-' + id);
+  const bodyVal = document.getElementById(`draft-body-${id}`).value;
+  const msgEl = document.getElementById(`approval-msg-${id}`);
   try {
-    await api('POST', `/approvals/${id}/approve`, { body, force_immediate });
+    await api('POST', `/approvals/${id}/approve`, { body: bodyVal, force_immediate });
     toast(force_immediate ? '⚡ Sent immediately!' : '✅ Approved!');
     approvals();
-  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+  } catch(e) {
+    msgEl.innerHTML = '';
+    const alert = document.createElement('div');
+    alert.className = 'alert alert-error';
+    alert.textContent = e.message;
+    msgEl.appendChild(alert);
+  }
 }
 
 async function saveEdits(id) {
-  const body = document.getElementById('draft-body-' + id).value;
-  const msgEl = document.getElementById('approval-msg-' + id);
+  const bodyVal = document.getElementById(`draft-body-${id}`).value;
+  const msgEl = document.getElementById(`approval-msg-${id}`);
   try {
-    await api('POST', `/approvals/${id}/save`, { body });
+    await api('POST', `/approvals/${id}/save`, { body: bodyVal });
     msgEl.innerHTML = '<div class="alert alert-info">Edits saved.</div>';
-  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+  } catch(e) {
+    msgEl.innerHTML = '';
+    const alert = document.createElement('div');
+    alert.className = 'alert alert-error';
+    alert.textContent = e.message;
+    msgEl.appendChild(alert);
+  }
 }
 
 async function rejectDraft(id) {
-  const note = document.getElementById('reject-note-' + id).value;
-  const msgEl = document.getElementById('approval-msg-' + id);
+  const note = document.getElementById(`reject-note-${id}`).value;
+  const msgEl = document.getElementById(`approval-msg-${id}`);
   try {
     await api('POST', `/approvals/${id}/reject`, { note });
     toast('Draft rejected.', 'warn');
     approvals();
-  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+  } catch(e) {
+    msgEl.innerHTML = '';
+    const alert = document.createElement('div');
+    alert.className = 'alert alert-error';
+    alert.textContent = e.message;
+    msgEl.appendChild(alert);
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -384,58 +557,119 @@ async function manualQueue() {
   const data = await api('GET', '/manual');
   if (!data) return;
   const c = document.getElementById('page-content');
+
   if (!data.length) {
     c.innerHTML = '<h1>Manual Queue</h1><div class="alert alert-success">Manual queue is empty.</div>';
     return;
   }
-  c.innerHTML = '<h1>Manual Queue — Repeat Senders</h1>'
-    + '<p class="muted" style="margin-bottom:16px">These emails were held because the sender has contacted you frequently. You can send a manual reply directly, or generate an AI draft for review in Pending Approvals.</p>'
-    + data.map(em => `
-    <div class="expander" id="mexp-${em.id}">
-      <div class="expander-header" onclick="toggleMExp(${em.id})">
-        <span>🔁 <strong>${esc(em.sender)}</strong> &nbsp;|&nbsp; ${esc(em.subject||'(no subject)')} &nbsp;|&nbsp; Email #${em.sender_count||1} from this sender &nbsp;|&nbsp; <span class="muted">${(em.received_at||'').slice(0,16).replace('T',' ')}</span></span>
-        <span class="chevron" id="mchev-${em.id}" style="transform:rotate(180deg)">▼</span>
-      </div>
-      <div class="expander-body open" id="mexp-body-${em.id}">
 
-        <!-- Original email -->
-        <label>Original Message</label>
-        <textarea rows="6" disabled style="opacity:.7;margin-bottom:14px">${esc(em.body||'')}</textarea>
+  c.innerHTML = `<h1>Manual Queue — Repeat Senders</h1>
+    <p class="muted" style="margin-bottom:16px">These emails were held because the sender has contacted you frequently. You can send a manual reply directly, or generate an AI draft for review in Pending Approvals.</p>
+    <div id="manual-list"></div>`;
 
-        <!-- Manual reply section -->
-        <label>✍️ Type a Manual Reply</label>
-        <textarea rows="6" id="mreply-${em.id}" placeholder="Write your reply here…"></textarea>
-        <div class="row" style="margin-top:10px">
-          <button class="btn btn-primary btn-sm" onclick="sendManualReply(${em.id})">📤 Send Reply</button>
-          <button class="btn btn-ghost btn-sm"   onclick="clearManualReply(${em.id})">✕ Clear</button>
-        </div>
-        <div id="mreply-msg-${em.id}" style="margin-top:8px"></div>
+  const list = document.getElementById('manual-list');
 
-        <hr style="border:none;border-top:1px solid var(--border);margin:18px 0">
+  for (const em of data) {
+    const expander = document.createElement('div');
+    expander.className = 'expander';
+    expander.id = `mexp-${em.id}`;
 
-        <!-- AI generate section -->
-        <p class="muted" style="margin-bottom:8px">Or let the AI draft a response for review:</p>
-        <button class="btn btn-ghost btn-sm" onclick="generateManual(${em.id})">🤖 Generate AI Draft</button>
-        <div id="mq-msg-${em.id}" style="margin-top:8px"></div>
+    // Header
+    const header = document.createElement('div');
+    header.className = 'expander-header';
+    header.onclick = () => toggleMExp(em.id);
 
-      </div>
-    </div>`).join('');
+    const hSpan = document.createElement('span');
+    const strong = document.createElement('strong');
+    strong.textContent = em.sender;
+    hSpan.appendChild(document.createTextNode('🔁 '));
+    hSpan.appendChild(strong);
+    hSpan.appendChild(document.createTextNode(` | ${em.subject || '(no subject)'} | Email #${em.sender_count || 1} from this sender | `));
+    const timeSpan = document.createElement('span');
+    timeSpan.className = 'muted';
+    timeSpan.textContent = (em.received_at || '').slice(0, 16).replace('T', ' ');
+    hSpan.appendChild(timeSpan);
+
+    const chev = document.createElement('span');
+    chev.className = 'chevron';
+    chev.id = `mchev-${em.id}`;
+    chev.textContent = '▼';
+    chev.style.transform = 'rotate(180deg)';
+
+    header.append(hSpan, chev);
+
+    // Body
+    const bodyDiv = document.createElement('div');
+    bodyDiv.className = 'expander-body open';
+    bodyDiv.id = `mexp-body-${em.id}`;
+
+    const origLabel = document.createElement('label');
+    origLabel.textContent = 'Original Message';
+    const origTa = makeTextarea(`morig-${em.id}`, em.body || '', 6, true);
+    origTa.style.marginBottom = '14px';
+
+    const replyLabel = document.createElement('label');
+    replyLabel.textContent = '✍️ Type a Manual Reply';
+    const replyTa = makeTextarea(`mreply-${em.id}`, '', 6, false);
+    replyTa.placeholder = 'Write your reply here…';
+
+    const replyRow = document.createElement('div');
+    replyRow.className = 'row';
+    replyRow.style.marginTop = '10px';
+
+    const btnSend = document.createElement('button');
+    btnSend.className = 'btn btn-primary btn-sm';
+    btnSend.textContent = '📤 Send Reply';
+    btnSend.onclick = () => sendManualReply(em.id);
+
+    const btnClear = document.createElement('button');
+    btnClear.className = 'btn btn-ghost btn-sm';
+    btnClear.textContent = '✕ Clear';
+    btnClear.onclick = () => clearManualReply(em.id);
+
+    replyRow.append(btnSend, btnClear);
+
+    const replyMsg = document.createElement('div');
+    replyMsg.id = `mreply-msg-${em.id}`;
+    replyMsg.style.marginTop = '8px';
+
+    const divider = document.createElement('hr');
+    divider.style.cssText = 'border:none;border-top:1px solid var(--border);margin:18px 0';
+
+    const aiHint = document.createElement('p');
+    aiHint.className = 'muted';
+    aiHint.style.marginBottom = '8px';
+    aiHint.textContent = 'Or let the AI draft a response for review:';
+
+    const btnAI = document.createElement('button');
+    btnAI.className = 'btn btn-ghost btn-sm';
+    btnAI.textContent = '🤖 Generate AI Draft';
+    btnAI.onclick = () => generateManual(em.id);
+
+    const mqMsg = document.createElement('div');
+    mqMsg.id = `mq-msg-${em.id}`;
+    mqMsg.style.marginTop = '8px';
+
+    bodyDiv.append(origLabel, origTa, replyLabel, replyTa, replyRow, replyMsg, divider, aiHint, btnAI, mqMsg);
+    expander.append(header, bodyDiv);
+    list.appendChild(expander);
+  }
 }
 
 function toggleMExp(id) {
-  const body  = document.getElementById('mexp-body-' + id);
-  const chev  = document.getElementById('mchev-' + id);
-  const open  = body.classList.toggle('open');
-  chev.style.transform = open ? 'rotate(180deg)' : '';
+  const body = document.getElementById(`mexp-body-${id}`);
+  const chev = document.getElementById(`mchev-${id}`);
+  const open = body.classList.toggle('open');
+  if (chev) chev.style.transform = open ? 'rotate(180deg)' : '';
 }
 
 function clearManualReply(id) {
-  document.getElementById('mreply-' + id).value = '';
+  document.getElementById(`mreply-${id}`).value = '';
 }
 
 async function sendManualReply(id) {
-  const body   = document.getElementById('mreply-' + id).value.trim();
-  const msgEl  = document.getElementById('mreply-msg-' + id);
+  const body = document.getElementById(`mreply-${id}`).value.trim();
+  const msgEl = document.getElementById(`mreply-msg-${id}`);
   if (!body) {
     msgEl.innerHTML = '<div class="alert alert-error">Reply cannot be empty.</div>';
     return;
@@ -446,18 +680,28 @@ async function sendManualReply(id) {
     toast('✅ Manual reply sent!');
     manualQueue();
   } catch(e) {
-    msgEl.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+    msgEl.innerHTML = '';
+    const alert = document.createElement('div');
+    alert.className = 'alert alert-error';
+    alert.textContent = e.message;
+    msgEl.appendChild(alert);
   }
 }
 
 async function generateManual(id) {
-  const msgEl = document.getElementById('mq-msg-' + id);
+  const msgEl = document.getElementById(`mq-msg-${id}`);
   msgEl.innerHTML = '<span class="spinner"></span> Generating…';
   try {
     await api('POST', `/manual/${id}/generate`);
     toast('Draft generated — check Pending Approvals.');
     manualQueue();
-  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+  } catch(e) {
+    msgEl.innerHTML = '';
+    const alert = document.createElement('div');
+    alert.className = 'alert alert-error';
+    alert.textContent = e.message;
+    msgEl.appendChild(alert);
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -467,47 +711,92 @@ async function sentEmails() {
   const data = await api('GET', '/sent');
   if (!data) return;
   const c = document.getElementById('page-content');
+
   if (!data.length) {
     c.innerHTML = '<h1>Sent Emails</h1><div class="alert alert-info">No emails sent yet.</div>';
     return;
   }
-  c.innerHTML = '<h1>Sent Emails</h1>' +
-    data.map(item => {
-      const { email: em, sent_body, sent_at } = item;
-      return `
-      <div class="expander">
-        <div class="expander-header" onclick="this.nextElementSibling.classList.toggle('open');this.querySelector('.chevron').style.transform=this.nextElementSibling.classList.contains('open')?'rotate(180deg)':''">
-          <span>✅ <strong>${em.sender}</strong> &nbsp;|&nbsp; ${em.subject||''} &nbsp;|&nbsp; ${(em.received_at||'').slice(0,10)}</span>
-          <span class="chevron">▼</span>
-        </div>
-        <div class="expander-body">
-          <div class="two-col">
-            <div><label>Original</label><textarea rows="6" disabled style="opacity:.7">${esc(em.body||'')}</textarea></div>
-            <div><label>Sent Response</label><textarea rows="6" disabled style="opacity:.7">${esc(sent_body||'')}</textarea></div>
-          </div>
-          ${sent_at ? `<p class="muted" style="margin-top:8px">Sent at: ${sent_at.slice(0,16).replace('T',' ')}</p>` : ''}
-        </div>
-      </div>`;
-    }).join('');
+
+  c.innerHTML = '<h1>Sent Emails</h1><div id="sent-list"></div>';
+  const list = document.getElementById('sent-list');
+
+  for (const item of data) {
+    const { email: em, sent_body, sent_at } = item;
+
+    const expander = document.createElement('div');
+    expander.className = 'expander';
+
+    const header = document.createElement('div');
+    header.className = 'expander-header';
+    header.onclick = function() {
+      const bd = this.nextElementSibling;
+      bd.classList.toggle('open');
+      this.querySelector('.chevron').style.transform = bd.classList.contains('open') ? 'rotate(180deg)' : '';
+    };
+
+    const hSpan = document.createElement('span');
+    const strong = document.createElement('strong');
+    strong.textContent = em.sender;
+    hSpan.appendChild(document.createTextNode('✅ '));
+    hSpan.appendChild(strong);
+    hSpan.appendChild(document.createTextNode(` | ${em.subject || ''} | ${(em.received_at || '').slice(0, 10)}`));
+
+    const chev = document.createElement('span');
+    chev.className = 'chevron';
+    chev.textContent = '▼';
+
+    header.append(hSpan, chev);
+
+    const bodyDiv = document.createElement('div');
+    bodyDiv.className = 'expander-body';
+
+    const twocol = document.createElement('div');
+    twocol.className = 'two-col';
+
+    const leftCol = document.createElement('div');
+    const leftLabel = document.createElement('label');
+    leftLabel.textContent = 'Original';
+    const origTa = makeTextarea('', em.body || '', 6, true);
+    leftCol.append(leftLabel, origTa);
+
+    const rightCol = document.createElement('div');
+    const rightLabel = document.createElement('label');
+    rightLabel.textContent = 'Sent Response';
+    const sentTa = makeTextarea('', sent_body || '', 6, true);
+    rightCol.append(rightLabel, sentTa);
+
+    twocol.append(leftCol, rightCol);
+    bodyDiv.appendChild(twocol);
+
+    if (sent_at) {
+      const p = document.createElement('p');
+      p.className = 'muted';
+      p.style.marginTop = '8px';
+      p.textContent = `Sent at: ${sent_at.slice(0, 16).replace('T', ' ')}`;
+      bodyDiv.appendChild(p);
+    }
+
+    expander.append(header, bodyDiv);
+    list.appendChild(expander);
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // TEMPLATES  (with custom query type management)
 // ══════════════════════════════════════════════════════════════════════════════
 async function templates() {
-  // Load both templates and query types in parallel
   const [tmplData, qtData] = await Promise.all([
     api('GET', '/templates'),
     api('GET', '/templates/query-types'),
   ]);
   if (!tmplData || !qtData) return;
 
-  // Cache for use in the create form
   _queryTypeCache = qtData.map(q => q.name);
 
   const c = document.getElementById('page-content');
 
-  // ── Existing templates ────────────────────────────────────────────────────
+  // ── Existing templates HTML (template name/query_type are admin-created,
+  //    but still escaped for defence-in-depth) ──────────────────────────────
   const tmplHtml = tmplData.map(t => {
     const delay = t.send_delay_seconds || 0;
     let initUnit = 'Minutes', initVal = 0;
@@ -518,7 +807,7 @@ async function templates() {
     return `
     <div class="expander">
       <div class="expander-header" onclick="this.nextElementSibling.classList.toggle('open');this.querySelector('.chevron').style.transform=this.nextElementSibling.classList.contains('open')?'rotate(180deg)':''">
-        <span>📋 <strong>${t.name}</strong> &nbsp;|&nbsp; Type: ${t.query_type||''}</span>
+        <span>📋 <strong>${esc(t.name)}</strong> &nbsp;|&nbsp; Type: ${esc(t.query_type||'')}</span>
         <span class="chevron">▼</span>
       </div>
       <div class="expander-body">
@@ -530,7 +819,7 @@ async function templates() {
         <div class="three-col" style="margin-top:4px">
           <div>
             <label>Amount</label>
-            <input type="number" id="tdv-${t.id}" min="0" value="${initVal}">
+            <input type="number" id="tdv-${t.id}" min="0" value="${parseInt(initVal)||0}">
           </div>
           <div>
             <label>Unit</label>
@@ -541,42 +830,28 @@ async function templates() {
             </select>
           </div>
           <div style="display:flex;align-items:flex-end">
-            <span class="muted" id="tdc-${t.id}">${delayCaption(initVal, initUnit)}</span>
+            <span class="muted" id="tdc-${t.id}">${esc(delayCaption(initVal, initUnit))}</span>
           </div>
         </div>
         <div id="tmpl-msg-${t.id}" style="margin-top:8px"></div>
-        <button class="btn btn-primary btn-sm" style="margin-top:12px" onclick="saveTemplate(${t.id})">Save</button>
+        <button class="btn btn-primary btn-sm" style="margin-top:12px" onclick="saveTemplate(${parseInt(t.id)})">Save</button>
       </div>
     </div>`;
   }).join('');
 
   // ── Query type pills ──────────────────────────────────────────────────────
-  const pillsHtml = qtData.map(q => {
-    const cls = q.is_builtin ? 'builtin' : 'custom';
-    const icon = q.is_builtin ? '🔒' : '✏️';
-    const delBtn = !q.is_builtin
-      ? `<button class="del-btn" title="Delete" onclick="deleteQueryType('${esc(q.name)}')">✕</button>`
-      : '';
-    const kw = q.keywords ? `<span style="opacity:.6;font-size:10px"> · ${q.keywords.split(',').slice(0,3).join(', ')}${q.keywords.split(',').length>3?'…':''}</span>` : '';
-    return `<span class="qt-pill ${cls}">${icon} ${esc(q.name)}${kw}${delBtn}</span>`;
-  }).join('');
-
+  // Pills are built via DOM to prevent XSS in custom query type names/keywords
   c.innerHTML = `
     <h1>Response Templates</h1>
     <p class="muted" style="margin-bottom:16px">Use <code>{{ai_response}}</code> and <code>{{customer_name}}</code> as placeholders.</p>
     ${tmplHtml}
-
     <hr class="divider">
-
-    <!-- ── Query Type Manager ── -->
     <h2>📂 Query Type Manager</h2>
     <p class="muted" style="margin-bottom:12px">
       🔒 Built-in types cannot be deleted. ✏️ Custom types are user-defined.<br>
       You can add keywords to any type to improve the AI keyword-fallback classifier.
     </p>
-
-    <div class="qt-list" id="qt-pill-list">${pillsHtml}</div>
-
+    <div class="qt-list" id="qt-pill-list"></div>
     <div class="card" style="margin-top:16px">
       <h2 style="margin-top:0;margin-bottom:14px;font-size:15px">Add / Update Query Type</h2>
       <div class="two-col">
@@ -594,18 +869,13 @@ async function templates() {
       <div id="qt-msg" style="margin-top:8px"></div>
       <button class="btn btn-primary btn-sm" style="margin-top:14px" onclick="saveQueryType()">💾 Save Query Type</button>
     </div>
-
     <hr class="divider">
-
-    <!-- ── Add New Template ── -->
     <h2>Add New Template</h2>
     <div class="card">
       <label>Name (unique)</label><input type="text" id="n-name">
       <label>Query Type</label>
       <input type="text" id="n-type" placeholder="Type or choose — e.g. billing, warranty…" list="qt-datalist">
-      <datalist id="qt-datalist">
-        ${_queryTypeCache.map(n => `<option value="${esc(n)}">`).join('')}
-      </datalist>
+      <datalist id="qt-datalist"></datalist>
       <p class="hint">Type a query type name. All types (built-in + custom) are suggested.</p>
       <label>Subject Line</label><input type="text" id="n-subj">
       <label>Body</label><textarea rows="5" id="n-body"></textarea>
@@ -617,6 +887,46 @@ async function templates() {
       <div id="new-tmpl-msg" style="margin-top:8px"></div>
       <button class="btn btn-primary" style="margin-top:14px" onclick="createTemplate()">Create Template</button>
     </div>`;
+
+  // Build pills via DOM
+  const pillList = document.getElementById('qt-pill-list');
+  for (const q of qtData) {
+    const pill = document.createElement('span');
+    pill.className = `qt-pill ${q.is_builtin ? 'builtin' : 'custom'}`;
+
+    const icon = document.createTextNode(q.is_builtin ? '🔒 ' : '✏️ ');
+    const nameTxt = document.createTextNode(q.name);
+    pill.append(icon, nameTxt);
+
+    if (q.keywords) {
+      const kws = q.keywords.split(',').slice(0, 3).map(k => k.trim()).join(', ');
+      const kwSpan = document.createElement('span');
+      kwSpan.style.cssText = 'opacity:.6;font-size:10px';
+      kwSpan.textContent = ` · ${kws}${q.keywords.split(',').length > 3 ? '…' : ''}`;
+      pill.appendChild(kwSpan);
+    }
+
+    if (!q.is_builtin) {
+      const del = document.createElement('button');
+      del.className = 'del-btn';
+      del.title = 'Delete';
+      del.textContent = '✕';
+      // Store name as data attribute to avoid closure over loop variable
+      del.dataset.name = q.name;
+      del.onclick = function() { deleteQueryType(this.dataset.name); };
+      pill.appendChild(del);
+    }
+
+    pillList.appendChild(pill);
+  }
+
+  // Build datalist options safely
+  const datalist = document.getElementById('qt-datalist');
+  for (const name of _queryTypeCache) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    datalist.appendChild(opt);
+  }
 }
 
 function delayCaption(val, unit) {
@@ -625,17 +935,23 @@ function delayCaption(val, unit) {
 }
 
 async function saveTemplate(id) {
-  const subject = document.getElementById('ts-' + id).value;
-  const body = document.getElementById('tb-' + id).value;
-  const val = parseInt(document.getElementById('tdv-' + id).value) || 0;
-  const unit = document.getElementById('tdu-' + id).value;
+  const subject = document.getElementById(`ts-${id}`).value;
+  const body = document.getElementById(`tb-${id}`).value;
+  const val = parseInt(document.getElementById(`tdv-${id}`).value) || 0;
+  const unit = document.getElementById(`tdu-${id}`).value;
   const mult = { Minutes: 60, Hours: 3600, Days: 86400 }[unit];
   const delay = val > 0 ? val * mult : null;
-  const msgEl = document.getElementById('tmpl-msg-' + id);
+  const msgEl = document.getElementById(`tmpl-msg-${id}`);
   try {
     await api('PUT', `/templates/${id}`, { subject, body, send_delay_seconds: delay });
     msgEl.innerHTML = '<div class="alert alert-success">Template saved.</div>';
-  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+  } catch(e) {
+    msgEl.innerHTML = '';
+    const alert = document.createElement('div');
+    alert.className = 'alert alert-error';
+    alert.textContent = e.message;
+    msgEl.appendChild(alert);
+  }
 }
 
 async function createTemplate() {
@@ -658,14 +974,19 @@ async function createTemplate() {
     await api('POST', '/templates', { name, query_type, subject, body, send_delay_seconds: delay });
     toast('Template created!');
     templates();
-  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+  } catch(e) {
+    msgEl.innerHTML = '';
+    const alert = document.createElement('div');
+    alert.className = 'alert alert-error';
+    alert.textContent = e.message;
+    msgEl.appendChild(alert);
+  }
 }
 
-// ── Query Type CRUD helpers ───────────────────────────────────────────────────
 async function saveQueryType() {
-  const name     = document.getElementById('qt-name').value.trim().toLowerCase();
+  const name = document.getElementById('qt-name').value.trim().toLowerCase();
   const keywords = document.getElementById('qt-keywords').value.trim();
-  const msgEl    = document.getElementById('qt-msg');
+  const msgEl = document.getElementById('qt-msg');
 
   if (!name) {
     msgEl.innerHTML = '<div class="alert alert-error">Query type name cannot be empty.</div>';
@@ -679,12 +1000,15 @@ async function saveQueryType() {
   try {
     await api('POST', '/templates/query-types', { name, keywords });
     toast(`Query type "${name}" saved!`);
-    // Clear inputs and reload
     document.getElementById('qt-name').value = '';
     document.getElementById('qt-keywords').value = '';
     templates();
   } catch(e) {
-    msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`;
+    msgEl.innerHTML = '';
+    const alert = document.createElement('div');
+    alert.className = 'alert alert-error';
+    alert.textContent = e.message;
+    msgEl.appendChild(alert);
   }
 }
 
@@ -706,6 +1030,7 @@ async function settings() {
   const data = await api('GET', '/settings');
   if (!data) return;
   const c = document.getElementById('page-content');
+  // Settings values are admin-controlled config, but still escaped for safety
   c.innerHTML = `
     <h1>⚙️ Settings</h1>
     <p class="muted" style="margin-bottom:20px">Changes are saved to the database and take effect immediately — no restart needed.</p>
@@ -725,7 +1050,7 @@ async function settings() {
       <div class="expander-body">
         <div class="two-col">
           <div><label>IMAP Host</label><input type="text" id="s-IMAP_HOST" value="${esc(data.IMAP_HOST||'imap.gmail.com')}"></div>
-          <div><label>IMAP Port</label><input type="number" id="s-IMAP_PORT" value="${data.IMAP_PORT||993}"></div>
+          <div><label>IMAP Port</label><input type="number" id="s-IMAP_PORT" value="${parseInt(data.IMAP_PORT)||993}"></div>
         </div>
         <label>Sent Folder Override</label>
         <input type="text" id="s-IMAP_SENT_FOLDER" value="${esc(data.IMAP_SENT_FOLDER||'')}" placeholder="Leave blank for auto-detect">
@@ -737,7 +1062,7 @@ async function settings() {
       <div class="expander-body">
         <div class="three-col">
           <div><label>SMTP Host</label><input type="text" id="s-SMTP_HOST" value="${esc(data.SMTP_HOST||'smtp.gmail.com')}"></div>
-          <div><label>SMTP Port</label><input type="number" id="s-SMTP_PORT" value="${data.SMTP_PORT||587}"></div>
+          <div><label>SMTP Port</label><input type="number" id="s-SMTP_PORT" value="${parseInt(data.SMTP_PORT)||587}"></div>
           <div><label>SMTP Mode</label>
             <select id="s-SMTP_MODE">
               <option value="auto" ${data.SMTP_MODE==='auto'||!data.SMTP_MODE?'selected':''}>auto</option>
@@ -753,8 +1078,8 @@ async function settings() {
       <div class="expander-header" onclick="this.nextElementSibling.classList.toggle('open')"><span>🤖 Agent Behaviour</span><span class="chevron">▼</span></div>
       <div class="expander-body">
         <div class="two-col">
-          <div><label>Poll Interval (seconds)</label><input type="number" id="s-POLL_INTERVAL_SECONDS" value="${data.POLL_INTERVAL_SECONDS||60}" min="10" max="86400"></div>
-          <div><label>Max Repeat Count (before manual queue)</label><input type="number" id="s-MAX_REPEAT_COUNT" value="${data.MAX_REPEAT_COUNT||3}" min="1"></div>
+          <div><label>Poll Interval (seconds)</label><input type="number" id="s-POLL_INTERVAL_SECONDS" value="${parseInt(data.POLL_INTERVAL_SECONDS)||60}" min="10" max="86400"></div>
+          <div><label>Max Repeat Count (before manual queue)</label><input type="number" id="s-MAX_REPEAT_COUNT" value="${parseInt(data.MAX_REPEAT_COUNT)||3}" min="1"></div>
         </div>
         <label>Primary Gemini Model</label>
         <input type="text" id="s-GEMINI_MODEL" value="${esc(data.GEMINI_MODEL||'gemma-4-31b-it')}">
@@ -784,7 +1109,13 @@ async function saveSettings() {
   try {
     await api('POST', '/settings', { settings: settingsPayload });
     msgEl.innerHTML = '<div class="alert alert-success">✅ Settings saved!</div>';
-  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+  } catch(e) {
+    msgEl.innerHTML = '';
+    const alert = document.createElement('div');
+    alert.className = 'alert alert-error';
+    alert.textContent = e.message;
+    msgEl.appendChild(alert);
+  }
 }
 
 async function testSmtp() {
@@ -799,8 +1130,15 @@ async function testSmtp() {
       address: document.getElementById('s-EMAIL_ADDRESS').value,
       password: pw !== '••••••••' ? pw : '',
     });
-    msgEl.innerHTML = `<div class="alert alert-success">${res.detail}</div>`;
-  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+    msgEl.innerHTML = '<div class="alert alert-success"></div>';
+    msgEl.firstChild.textContent = res.detail;
+  } catch(e) {
+    msgEl.innerHTML = '';
+    const alert = document.createElement('div');
+    alert.className = 'alert alert-error';
+    alert.textContent = e.message;
+    msgEl.appendChild(alert);
+  }
 }
 
 async function runPipeline() {
@@ -809,11 +1147,14 @@ async function runPipeline() {
   try {
     await api('POST', '/settings/run-pipeline');
     msgEl.innerHTML = '<div class="alert alert-success">Pipeline complete.</div>';
-  } catch(e) { msgEl.innerHTML = `<div class="alert alert-error">${e.message}</div>`; }
+  } catch(e) {
+    msgEl.innerHTML = '';
+    const alert = document.createElement('div');
+    alert.className = 'alert alert-error';
+    alert.textContent = e.message;
+    msgEl.appendChild(alert);
+  }
 }
-
-// ── Utility ──────────────────────────────────────────────────────────────────
-function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 init();
