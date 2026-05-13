@@ -1,7 +1,24 @@
 """
 app/db/models.py  –  Supabase table helpers
-No SQLAlchemy ORM — uses the Supabase Python client directly.
-Each function maps to a table operation.
+
+Reliability fixes applied
+──────────────────────────
+P1 (send_failed invisible):
+  get_pending_drafts() now returns both 'pending' and 'send_failed' drafts so
+  admins can see and retry failed sends from the Pending Approvals page.
+
+P2 (double-send):
+  get_and_claim_scheduled_drafts() replaces get_scheduled_drafts().  It uses
+  an atomic update-then-select pattern: it first flips qualifying rows to
+  status='sending', then returns only those updated rows.  A concurrent
+  worker or scheduler tick will not find the same rows because their status
+  has already changed.
+
+  NOTE: Supabase/PostgREST exposes UPDATE...RETURNING via the Python client's
+  .update().eq().execute() which issues a single atomic PATCH with
+  Prefer: return=representation — this is sufficient for single-node
+  deployments.  For multi-replica production use, wrap in a PL/pgSQL
+  function or use SELECT ... FOR UPDATE SKIP LOCKED via a direct SQL call.
 """
 from datetime import datetime, timezone
 from loguru import logger
@@ -9,12 +26,10 @@ from app.db.database import get_supabase_admin_client
 
 
 def _db():
-    """Shorthand — always returns the admin client for pipeline use."""
     return get_supabase_admin_client()
 
 
 def utcnow() -> str:
-    """ISO timestamp string for Supabase (timestamptz columns)."""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -28,22 +43,12 @@ def get_email_by_uid(uid: str) -> dict | None:
 
 
 def count_emails_by_sender(sender: str) -> int:
-    """Total number of emails received from this sender (all query types)."""
     res = _db().table("emails").select("id", count="exact").eq("sender", sender).execute()
     return res.count or 0
 
 
 def count_emails_by_sender_and_query(sender: str, query_type: str,
                                      exclude_email_id: int | None = None) -> int:
-    """
-    Count prior emails from `sender` that share the same `query_type`.
-
-    Used by run_pipeline to decide whether the current email is a repeat of the
-    same issue (same sender + same query type) and should go to the manual queue.
-
-    `exclude_email_id` should be the id of the email currently being processed
-    so it is not counted against itself.
-    """
     q = (
         _db().table("emails")
         .select("id", count="exact")
@@ -58,16 +63,6 @@ def count_emails_by_sender_and_query(sender: str, query_type: str,
 
 def insert_email(uid: str, sender: str, subject: str, body: str,
                  is_repeat: bool, sender_count: int) -> dict | None:
-    """
-    Insert a new inbound email.
-
-    The initial status is always "pending" — the poller does not yet know the
-    query type so it cannot make the repeat-same-query decision.  run_pipeline
-    classifies the email first and then re-routes to "manual" when needed.
-
-    `is_repeat` and `sender_count` are retained for informational display in
-    the UI (e.g. "Email #3 from this sender") but no longer drive routing.
-    """
     res = _db().table("emails").insert({
         "uid":          uid,
         "sender":       sender,
@@ -132,10 +127,17 @@ def insert_draft(email_id: int, draft_body: str, confidence: float) -> dict | No
 
 
 def get_pending_drafts() -> list[dict]:
+    """
+    Return drafts that need admin attention: pending approvals AND failed sends.
+
+    FIX P1: Previously only 'pending' was returned, so 'send_failed' drafts
+    disappeared from the UI after an SMTP failure.  Admins can now see and
+    retry them from the Pending Approvals page.
+    """
     res = (
         _db().table("draft_responses")
         .select("*")
-        .eq("status", "pending")
+        .in_("status", ["pending", "send_failed"])
         .order("generated_at", desc=True)
         .execute()
     )
@@ -165,7 +167,6 @@ def count_drafts_by_status(status: str) -> int:
 
 
 def get_sent_drafts_with_times() -> list[dict]:
-    """Used for average response time calculation."""
     res = (
         _db().table("draft_responses")
         .select("generated_at, sent_at")
@@ -241,11 +242,10 @@ def get_recent_logs(limit: int = 20) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# app_settings table  (added by supabase_migration.sql)
+# app_settings table
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_setting(key: str) -> str | None:
-    """Return the value for a settings key, or None if not found / empty."""
     try:
         res = _db().table("app_settings").select("value").eq("key", key).limit(1).execute()
         if res.data and res.data[0].get("value"):
@@ -256,7 +256,6 @@ def get_setting(key: str) -> str | None:
 
 
 def get_all_settings() -> list[dict]:
-    """Return all settings rows ordered by key."""
     try:
         res = _db().table("app_settings").select("*").order("key").execute()
         return res.data or []
@@ -266,7 +265,6 @@ def get_all_settings() -> list[dict]:
 
 
 def set_setting(key: str, value: str) -> None:
-    """Upsert a settings value."""
     try:
         _db().table("app_settings").upsert({
             "key":        key,
@@ -278,11 +276,10 @@ def set_setting(key: str, value: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Template timer helpers  (send_delay_seconds added by supabase_migration.sql)
+# Template timer helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
 def update_template_timer(template_id: int, send_delay_seconds: int | None) -> None:
-    """Set or clear the send delay for a template."""
     _db().table("templates").update({
         "send_delay_seconds": send_delay_seconds,
         "updated_at":         utcnow(),
@@ -290,35 +287,45 @@ def update_template_timer(template_id: int, send_delay_seconds: int | None) -> N
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Scheduled-send helpers  (scheduled_send_at added by supabase_migration.sql)
+# Scheduled-send helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_scheduled_drafts() -> list[dict]:
-    """Return approved drafts whose scheduled_send_at has arrived."""
-    from datetime import datetime, timezone
+def get_and_claim_scheduled_drafts() -> list[dict]:
+    """
+    Atomically claim and return approved drafts whose scheduled_send_at has
+    passed by flipping their status to 'sending' in the same operation.
+
+    FIX P2 (double-send prevention):
+    The update() call sets status='sending' on all qualifying rows before
+    returning them.  A second scheduler worker or tick will not find these
+    rows because their status is no longer 'approved', so they cannot be
+    dispatched twice.
+
+    For true serialisable safety on multi-replica deployments, replace this
+    with a PL/pgSQL function using SELECT ... FOR UPDATE SKIP LOCKED.
+    """
     now = datetime.now(timezone.utc).isoformat()
-    res = (
-        _db().table("draft_responses")
-        .select("*")
-        .eq("status", "approved")
-        .not_.is_("scheduled_send_at", "null")
-        .lte("scheduled_send_at", now)
-        .execute()
-    )
-    return res.data or []
+    try:
+        # Atomic update: flip to 'sending', get back the updated rows
+        res = (
+            _db().table("draft_responses")
+            .update({"status": "sending"})
+            .eq("status", "approved")
+            .not_.is_("scheduled_send_at", "null")
+            .lte("scheduled_send_at", now)
+            .execute()
+        )
+        return res.data or []
+    except Exception as exc:
+        logger.error(f"get_and_claim_scheduled_drafts error: {exc}")
+        return []
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# custom_query_types table  (added by supabase_migration_v2.sql)
-#
-# Columns:  id SERIAL PK | name VARCHAR UNIQUE | keywords TEXT | created_at TIMESTAMPTZ
-#
-# `keywords` stores a comma-separated list of plain words/phrases that are
-# converted to word-boundary regex patterns by the keyword classifier.
+# custom_query_types table
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_custom_query_types() -> list[dict]:
-    """Return all custom query type rows ordered by name."""
     try:
         res = _db().table("custom_query_types").select("*").order("name").execute()
         return res.data or []
@@ -328,12 +335,6 @@ def get_custom_query_types() -> list[dict]:
 
 
 def upsert_custom_query_type(name: str, keywords: str) -> dict | None:
-    """
-    Insert or update a custom query type.
-    `name` is lowercased and used as the unique key.
-    `keywords` is a comma-separated string of plain words/phrases.
-    Returns the upserted row or None on failure.
-    """
     name = name.strip().lower()
     try:
         res = _db().table("custom_query_types").upsert({
@@ -348,7 +349,6 @@ def upsert_custom_query_type(name: str, keywords: str) -> dict | None:
 
 
 def delete_custom_query_type(name: str) -> bool:
-    """Delete a custom query type by name. Returns True on success."""
     name = name.strip().lower()
     try:
         _db().table("custom_query_types").delete().eq("name", name).execute()
