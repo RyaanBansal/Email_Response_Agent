@@ -1,14 +1,18 @@
 """
 app/email/sender.py  –  SMTP outbound email sender
 
-Connection strategy (auto-detected from SMTP_PORT, overridable via SMTP_MODE):
-  Port 465            → SMTP_SSL  (SSL from the start)
-  Port 587 or 25      → SMTP + STARTTLS
-  SMTP_MODE=ssl       → force SMTP_SSL  regardless of port
-  SMTP_MODE=starttls  → force SMTP + STARTTLS regardless of port
+Security / reliability fixes applied
+──────────────────────────────────────
+P1 (Missing credentials treated as success):
+  send_email() previously returned True in dry-run mode, which caused the
+  orchestrator to mark emails as 'sent' even when no email was dispatched.
+  It now returns False when credentials are absent, so the draft is left in
+  'send_failed' status and remains visible in the UI for retry.
 
-Settings are resolved at call-time from app_settings DB table (editable in the
-Settings UI) with fallback to .env — so no restart is needed after a change.
+P3/P1 (send_failed status):
+  Works in conjunction with orchestrator.py fix — _do_send() now sets
+  draft status to 'send_failed' on failure so the admin can see and retry
+  the item, rather than it silently disappearing from all queues.
 """
 import os
 import ssl
@@ -88,21 +92,26 @@ def send_email(to: str, subject: str, body: str) -> bool:
     """
     Send a plain-text email via SMTP and append it to the IMAP Sent folder.
     Credentials and server settings are resolved live from app_settings / .env.
-    Returns True on success, False on failure.
+
+    Returns True on success, False on any failure — including missing
+    credentials (previously this returned True, silently losing emails).
     """
-    smtp_host    = _cfg("SMTP_HOST", "smtp.gmail.com")
-    smtp_port    = int(_cfg("SMTP_PORT", "587"))
-    smtp_mode    = _cfg("SMTP_MODE", "").lower()
-    imap_host    = _cfg("IMAP_HOST", "imap.gmail.com")
-    imap_port    = int(_cfg("IMAP_PORT", "993"))
-    email_addr   = _cfg("EMAIL_ADDRESS")
-    email_pass   = _cfg("EMAIL_PASSWORD")
+    smtp_host     = _cfg("SMTP_HOST", "smtp.gmail.com")
+    smtp_port     = int(_cfg("SMTP_PORT", "587"))
+    smtp_mode     = _cfg("SMTP_MODE", "").lower()
+    imap_host     = _cfg("IMAP_HOST", "imap.gmail.com")
+    imap_port     = int(_cfg("IMAP_PORT", "993"))
+    email_addr    = _cfg("EMAIL_ADDRESS")
+    email_pass    = _cfg("EMAIL_PASSWORD")
     sent_override = _cfg("IMAP_SENT_FOLDER", "")
 
+    # ── FIX P1: missing credentials are a hard failure, not a silent no-op ──
     if not email_addr or not email_pass:
-        logger.warning("SMTP credentials not set. Email NOT sent (dry-run).")
-        logger.info(f"[DRY-RUN] To: {to} | Subject: {subject}")
-        return True
+        logger.error(
+            "SMTP credentials (EMAIL_ADDRESS / EMAIL_PASSWORD) are not configured. "
+            "Email NOT sent. Set credentials in Settings or .env and retry."
+        )
+        return False   # was True — caused DB records to be falsely marked 'sent'
 
     msg       = _build_message(email_addr, to, subject, body)
     raw_bytes = msg.as_bytes()
