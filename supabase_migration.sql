@@ -191,3 +191,37 @@ BEGIN
     WITH CHECK (true);
   END IF;
 END $$;
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Migration: security & reliability fixes
+-- Run AFTER supabase_migration.sql in: Supabase Dashboard → SQL Editor
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+-- ── 1. Add 'send_failed' and 'sending' to draft_responses status constraint ──
+-- 'send_failed' makes SMTP failures visible in the Pending Approvals UI.
+-- 'sending'     is the transient atomic-claim state used by the scheduler
+--               to prevent double-sends under concurrent workers.
+
+ALTER TABLE draft_responses
+    DROP CONSTRAINT IF EXISTS draft_responses_status_check;
+
+ALTER TABLE draft_responses
+    ADD CONSTRAINT draft_responses_status_check
+    CHECK (status IN ('pending', 'approved', 'rejected', 'sent', 'send_failed', 'sending'));
+
+COMMENT ON COLUMN draft_responses.status IS
+    'pending      = awaiting admin review
+     approved     = admin approved; will be sent (immediately or at scheduled_send_at)
+     sending      = transient claim state — dispatcher has picked this row
+     sent         = email delivered successfully
+     send_failed  = SMTP delivery failed; visible in Pending Approvals for retry
+     rejected     = admin rejected; will not be sent';
+
+-- ── 2. Index to speed up dispatch query ─────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_drafts_scheduled
+    ON draft_responses (status, scheduled_send_at)
+    WHERE status = 'approved' AND scheduled_send_at IS NOT NULL;
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Done. No data migration needed — existing rows are unaffected.
+-- ═══════════════════════════════════════════════════════════════════════════════
