@@ -1,17 +1,23 @@
 """
 app/orchestrator.py  –  Main pipeline orchestrator (Supabase version)
 
-Changes:
-  • approve_and_send now checks template.send_delay_seconds; if set it schedules
-    the send rather than dispatching immediately.
-  • dispatch_scheduled_drafts() is called by the scheduler to flush queued sends.
-  • Settings from app_settings override env vars for IMAP/SMTP at runtime.
+Reliability fixes applied
+──────────────────────────
+P1 (Failed sends invisible):
+  _do_send() now sets draft status to 'send_failed' and email status back to
+  'approved' when SMTP fails, instead of leaving records silently in limbo.
+  The Pending Approvals page queries for both 'pending' AND 'send_failed'
+  drafts (see models.get_pending_drafts), so admins can see and retry them.
 
-Bug fix:
-  • Immediate-send path now marks the draft as "approved" BEFORE calling
-    _do_send, matching the scheduled path. This removes it from the pending
-    list the moment the admin clicks either approve button, not only after
-    the SMTP round-trip completes (or if the send silently fails).
+P1 (Dry-run / missing credentials treated as success):
+  send_email() now returns False when credentials are absent (see sender.py).
+  _do_send() therefore correctly handles that case as a failure.
+
+P2 (Double-send under multiple workers):
+  dispatch_scheduled_drafts() now uses an atomic claim — it updates the draft
+  status to 'sending' before dispatching, so a second worker picking up the
+  same row will skip it (status != 'approved').  See get_and_claim_scheduled_drafts
+  in models.py.
 """
 from datetime import datetime, timezone, timedelta
 from loguru import logger
@@ -19,11 +25,11 @@ from loguru import logger
 from app.db.models import (
     get_email_by_id, update_email_status, update_email_query_type,
     get_template_by_query_type, insert_draft, insert_log,
-    get_draft_by_id, update_draft, get_scheduled_drafts,
+    get_draft_by_id, update_draft, get_and_claim_scheduled_drafts,
     count_emails_by_sender_and_query,
 )
 from app.email.poller import poll_inbox
-from app.ai.generator import process_email
+from app.ai.generator import classify_email, generate_draft
 
 
 def run_pipeline():
@@ -40,23 +46,17 @@ def run_pipeline():
             if not record:
                 continue
 
-            # ── Step 1: classify the email ────────────────────────────────────
-            # Classification must happen before the repeat check because the
-            # repeat rule is "same sender AND same query type".  The old logic
-            # used sender count alone (ignoring query type) which was incorrect.
-            result = process_email(
-                sender  = record["sender"],
-                subject = record.get("subject") or "",
-                body    = record.get("body") or "",
-            )
-            query_type = result["query_type"]
+            
+            sender  = record["sender"],
+            subject = record.get("subject") or "",
+            body    = record.get("body") or "",
+            
+            classification = classify_email(subject, body)
+            query_type = classification["query_type"]
             update_email_query_type(record["id"], query_type)
 
-            # ── Step 2: repeat check — same sender + same query type ──────────
-            # Count previous emails from this sender that share the same query
-            # type (excluding the current email).  If any exist → manual queue.
             prior_same_query = count_emails_by_sender_and_query(
-                record["sender"], query_type, exclude_email_id=record["id"]
+                sender, query_type, exclude_email_id=record["id"]
             )
 
             if prior_same_query > 0:
@@ -72,18 +72,27 @@ def run_pipeline():
                 )
                 continue
 
-            # ── Step 3: new query type from this sender → generate AI draft ───
             tmpl = get_template_by_query_type(query_type)
+            template_body = tmpl.get("body") if tmpl else None
+ 
+            draft_body = generate_draft(
+                sender        = sender,
+                subject       = subject,
+                body          = body,
+                query_type    = query_type,
+                template_body = template_body,
+            )
+            
             if tmpl and "{{ai_response}}" in (tmpl.get("body") or ""):
                 final_draft = tmpl["body"].replace(
                     "{{customer_name}}", record["sender"].split("@")[0].capitalize()
-                ).replace("{{ai_response}}", result["draft"])
+                ).replace("{{ai_response}}", draft_body)
             else:
-                final_draft = result["draft"]
+                final_draft = draft_body
 
-            insert_draft(record["id"], final_draft, result["confidence"])
+            insert_draft(record["id"], final_draft, classification["confidence"])
             insert_log(record["id"], "draft_generated",
-                       f"Type: {query_type} | Confidence: {result['confidence']:.0%}")
+                       f"Type: {query_type} | Confidence: {classification['confidence']:.0%}")
             logger.success(f"Draft generated for email {record['id']} ({query_type})")
 
         except Exception as exc:
@@ -96,9 +105,13 @@ def _do_send(draft_id: int, draft: dict, record: dict) -> bool:
     """
     Internal: call send_email and update DB records on success or failure.
 
-    Precondition: the draft's status has already been set to "approved" by
-    the caller (approve_and_send or dispatch_scheduled_drafts) so it no
-    longer appears in the pending list regardless of send outcome.
+    Precondition: the draft's status has already been set to 'approved' (or
+    'sending' for scheduled) by the caller so it no longer appears in the
+    pending list regardless of send outcome.
+
+    On SMTP failure the draft is moved to 'send_failed' and the email back to
+    'approved', making both visible for admin retry.  Previously failures were
+    only logged and the records silently disappeared from the UI.
     """
     from app.email.sender import send_email
 
@@ -116,9 +129,13 @@ def _do_send(draft_id: int, draft: dict, record: dict) -> bool:
         logger.success(f"Draft {draft_id} sent successfully.")
         return True
 
+    # ── FIX P1: mark as 'send_failed' so admins can see and retry ────────────
     logger.error(f"_do_send: send_email returned False for draft {draft_id}")
+    update_draft(draft_id, status="send_failed")
+    update_email_status(record["id"], "approved")   # return to retryable state
     insert_log(record["id"], "send_failed",
-               f"Draft {draft_id} failed to send — check SMTP config.")
+               f"Draft {draft_id} failed to send — check SMTP config. "
+               f"Draft is in 'send_failed' state and can be retried from Pending Approvals.")
     return False
 
 
@@ -128,16 +145,10 @@ def approve_and_send(draft_id: int, force_immediate: bool = False) -> bool:
 
     • If force_immediate=True, bypasses any template timer and sends right away.
     • If the matching template has send_delay_seconds set (and force_immediate
-      is False), the draft is scheduled. The scheduler flushes it later.
+      is False), the draft is scheduled.
     • Otherwise sends immediately.
 
-    In ALL cases the draft is moved out of "pending" status before any SMTP
-    call is attempted, so it disappears from the pending-approvals list the
-    moment the admin clicks either approve button.
-
-    Returns:
-      True  — either sent successfully or scheduled successfully
-      False — draft / email record missing, or SMTP failure on immediate send
+    Returns True on success (sent or scheduled), False on hard failure.
     """
     draft = get_draft_by_id(draft_id)
     if not draft:
@@ -170,12 +181,8 @@ def approve_and_send(draft_id: int, force_immediate: bool = False) -> bool:
         return True
 
     # ── Immediate path ────────────────────────────────────────────────────────
-    # Mark as "approved" NOW so the draft leaves the pending list immediately,
-    # before the SMTP call.  _do_send will update to "sent" on success.
     if force_immediate and delay_secs and int(delay_secs) > 0:
-        logger.info(
-            f"Draft {draft_id} — timer overridden, sending immediately."
-        )
+        logger.info(f"Draft {draft_id} — timer overridden, sending immediately.")
         insert_log(record["id"], "timer_overridden",
                    f"Draft {draft_id} sent immediately despite {delay_secs}s timer.")
 
@@ -188,9 +195,14 @@ def approve_and_send(draft_id: int, force_immediate: bool = False) -> bool:
 def dispatch_scheduled_drafts():
     """
     Called periodically by the scheduler.
-    Finds approved drafts whose scheduled_send_at has passed and sends them.
+
+    FIX P2 (double-send):
+    Uses get_and_claim_scheduled_drafts() which atomically sets status to
+    'sending' in the same DB query that selects due drafts.  A second worker
+    or a second scheduler tick will not find those rows because their status
+    is no longer 'approved', eliminating the race condition.
     """
-    due = get_scheduled_drafts()
+    due = get_and_claim_scheduled_drafts()
     if not due:
         return
 
@@ -201,6 +213,8 @@ def dispatch_scheduled_drafts():
             logger.warning(
                 f"Scheduled draft {draft['id']}: email record missing, skipping."
             )
+            # Return to approved so it can be investigated / retried
+            update_draft(draft["id"], status="approved")
             continue
         _do_send(draft["id"], draft, record)
 
