@@ -7,16 +7,21 @@ GET  /api/auth/me      → returns current user info
 
 Security fixes applied
 ──────────────────────
-P0 – get_current_user now calls verify_jwt (which validates the HS256
-     signature when SUPABASE_JWT_SECRET is configured) and additionally
-     enforces that the caller is an authorised admin via:
+P0 – get_current_user previously decoded the JWT locally with
+     verify_signature=False when SUPABASE_JWT_PUBLIC_KEY was absent,
+     meaning any structurally-valid JWT string was accepted regardless
+     of whether Supabase actually issued it or whether the session was
+     still active.
 
-       1. ADMIN_EMAILS env var  — comma-separated allowlist, OR
-       2. app_metadata.role == "admin" claim in the JWT payload.
+     Fix: always re-validate the cookie token against Supabase via
+     client.auth.get_user(token).  This is a live network call that:
+       • verifies the token was issued by this Supabase project,
+       • confirms the session has not been revoked,
+       • returns the canonical user object (email, id, app_metadata).
+     verify_jwt / SUPABASE_JWT_PUBLIC_KEY is no longer used here.
 
-     A valid Supabase session that does not satisfy either condition receives
-     403 Forbidden, so ordinary users who obtain a real JWT still cannot
-     reach admin routes.
+     Admin check is kept unchanged: ADMIN_EMAILS allowlist OR
+     app_metadata.role == "admin" in the Supabase user record.
 """
 import os
 from fastapi import APIRouter, Response, Request, HTTPException, Depends
@@ -49,26 +54,29 @@ def _auth_client():
     return create_client(SUPABASE_URL, SUPABASE_ANON)
 
 
-def _is_admin(payload: dict) -> bool:
+def _is_admin(email: str, app_metadata: dict) -> bool:
     """
-    Return True when the decoded JWT payload belongs to an admin user.
+    Return True when the user belongs to an admin account.
 
     Two complementary checks (either is sufficient):
       1. The user's email is in the ADMIN_EMAILS allowlist.
-      2. The JWT carries app_metadata.role == "admin"
+      2. The Supabase user record carries app_metadata.role == "admin"
          (set via Supabase Dashboard → Authentication → Users → Edit user).
+
+    If neither gate is configured at all, any authenticated user is
+    permitted with a loud warning — identical to the previous behaviour
+    so existing single-admin deployments are not broken.
     """
-    email = (payload.get("email") or "").lower()
+    email = (email or "").lower()
     if _ADMIN_EMAILS and email in _ADMIN_EMAILS:
         return True
 
-    app_meta = payload.get("app_metadata") or {}
-    if app_meta.get("role") == "admin":
+    if (app_metadata or {}).get("role") == "admin":
         return True
 
-    # If neither gate is configured at all, fall back to permitting any
-    # authenticated user — but warn loudly.
-    if not _ADMIN_EMAILS and not app_meta.get("role"):
+    # Fallback: if the operator has configured neither guard, allow any
+    # authenticated Supabase user but warn loudly.
+    if not _ADMIN_EMAILS and not (app_metadata or {}).get("role"):
         import warnings
         warnings.warn(
             "No ADMIN_EMAILS set and no app_metadata.role='admin' found. "
@@ -83,25 +91,45 @@ def _is_admin(payload: dict) -> bool:
 
 def get_current_user(request: Request) -> dict:
     """
-    Dependency – validates the session cookie, verifies the JWT signature,
-    and checks admin authorisation.
+    Dependency – re-validates the session cookie against Supabase on every
+    request, then checks admin authorisation.
 
-    Raises 401 when the token is missing or invalid.
+    Uses client.auth.get_user(token) instead of local JWT decoding so that:
+      • Tampered tokens are rejected (Supabase verifies the signature).
+      • Expired / revoked sessions are rejected (live DB check).
+      • The canonical user object (email, app_metadata) is always fresh.
+
+    Raises 401 when the token is missing, invalid, or the Supabase call fails.
     Raises 403 when the user is authenticated but not an admin.
     """
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    from app.db.database import verify_jwt
-    payload = verify_jwt(token)
-    if not payload:
+    # Live re-validation against Supabase — replaces local verify_jwt().
+    try:
+        client = _auth_client()
+        resp = client.auth.get_user(token)
+        if not resp or not resp.user:
+            raise HTTPException(status_code=401, detail="Invalid or expired session")
+        user = resp.user
+    except HTTPException:
+        raise
+    except Exception:
+        # Any network or auth error → treat as invalid session.
         raise HTTPException(status_code=401, detail="Invalid or expired session")
 
-    if not _is_admin(payload):
+    email       = (user.email or "").lower()
+    app_metadata = dict(user.app_metadata or {})
+
+    if not _is_admin(email, app_metadata):
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    return payload
+    return {
+        "email":        email,
+        "id":           str(user.id),
+        "app_metadata": app_metadata,
+    }
 
 
 @router.post("/login")
@@ -118,8 +146,8 @@ def login(body: LoginRequest, response: Response):
             key=SESSION_COOKIE,
             value=token,
             httponly=True,
-            samesite="lax",          # upgraded from 'lax' for CSRF protection
-            secure=False,                # must be True in production (HTTPS)
+            samesite="lax",
+            secure=False,            # set to True in production (HTTPS)
             max_age=60 * 60 * 8,
         )
         return {"user_email": resp.user.email, "user_id": str(resp.user.id)}
