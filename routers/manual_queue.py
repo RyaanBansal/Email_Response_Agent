@@ -4,6 +4,21 @@ routers/manual_queue.py  –  Manual (repeat-sender) queue
 GET  /api/manual                        → list emails in manual status
 POST /api/manual/{email_id}/generate    → force-generate an AI draft (with template) for a manual email
 POST /api/manual/{email_id}/reply       → submit a manually typed response and send it
+
+Reliability fix applied
+────────────────────────
+P2 (Manual reply SMTP failures disappear from retry queues):
+  submit_manual_reply() previously marked the draft 'approved' and the email
+  'approved' before calling send_email().  On SMTP failure it logged and
+  returned 500, but left the draft in 'approved' status.  Since pending
+  approvals only surfaces 'pending' and 'send_failed' drafts, and the manual
+  queue only surfaces 'manual' emails, the record became permanently invisible
+  to the admin with no way to retry.
+
+  Fix: on SMTP failure, roll back the draft to 'pending' (so it reappears in
+  Pending Approvals with the typed body preserved as edited_body) and the
+  email back to 'manual' (so it also reappears in the Manual Queue).  The
+  admin can then retry the send from either interface.
 """
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -77,8 +92,14 @@ def submit_manual_reply(email_id: int, payload: ManualReplyBody, _user=Depends(g
     Workflow:
       1. Validate the email exists and is in manual (or pending) status.
       2. Insert a draft record with confidence=1.0 (human-written).
-      3. Immediately send via SMTP using the same sender/subject as the original.
-      4. Mark the draft and email as sent.
+      3. Mark the draft/email 'approved' then attempt SMTP send.
+      4a. On success: mark both 'sent'.
+      4b. On failure: roll back draft to 'pending' and email to 'manual' so
+          the admin can retry from Pending Approvals or the Manual Queue.
+
+    FIX P2: Previously a failed send left the draft in 'approved' state which
+    is not surfaced by any UI queue, making it impossible to retry without
+    direct DB access.
     """
     record = get_email_by_id(email_id)
     if not record:
@@ -91,7 +112,9 @@ def submit_manual_reply(email_id: int, payload: ManualReplyBody, _user=Depends(g
     from app.email.sender import send_email
     from datetime import datetime, timezone
 
-    # Insert a draft record so we have an audit trail
+    # Insert a draft record so we have an audit trail.
+    # Store the body as edited_body so it survives rollback and is shown
+    # pre-filled if the admin retries from Pending Approvals.
     draft = insert_draft(email_id, payload.body.strip(), confidence=1.0)
     if not draft:
         raise HTTPException(status_code=500, detail="Failed to create draft record.")
@@ -100,7 +123,8 @@ def submit_manual_reply(email_id: int, payload: ManualReplyBody, _user=Depends(g
     subject  = f"Re: {record.get('subject') or 'Your Inquiry'}"
     now      = datetime.now(timezone.utc).isoformat()
 
-    # Mark draft approved before sending (removes from pending list immediately)
+    # Mark approved before sending so the draft is claimed and won't be
+    # picked up by the scheduled dispatcher.
     update_draft(draft_id, status="approved", approved_at=now)
     update_email_status(email_id, "approved")
 
@@ -113,10 +137,23 @@ def submit_manual_reply(email_id: int, payload: ManualReplyBody, _user=Depends(g
                    f"Manual reply sent by admin. Draft id: {draft_id}")
         return {"detail": "Reply sent successfully."}
 
-    # SMTP failed — leave email as approved so admin can retry from approvals
+    # FIX P2: SMTP failed — roll back so the admin can retry.
+    #
+    # Draft  → 'pending'  : reappears in Pending Approvals with body preserved.
+    # Email  → 'manual'   : reappears in Manual Queue.
+    #
+    # We also store the typed body as edited_body so it's pre-filled when the
+    # admin opens the draft in Pending Approvals, avoiding the need to retype.
+    update_draft(draft_id, status="pending", edited_body=payload.body.strip())
+    update_email_status(email_id, "manual")
     insert_log(email_id, "manual_reply_failed",
-               f"Manual reply SMTP failure. Draft id: {draft_id}. Check SMTP config.")
+               f"Manual reply SMTP failure. Draft id: {draft_id} rolled back to "
+               f"pending for retry. Check SMTP config.")
+
     raise HTTPException(
         status_code=500,
-        detail="Email drafted but SMTP send failed — check Settings -> SMTP config."
+        detail=(
+            "SMTP send failed — your reply has been saved as a draft in "
+            "Pending Approvals so you can retry it. Check Settings → SMTP config."
+        ),
     )
