@@ -1,22 +1,30 @@
 """
 main.py  –  FastAPI entry point for the Agentic Email System
 
-Fixes applied
-─────────────
-P2 (Render health check on authenticated endpoint):
-  Added GET /healthz that returns 200 without requiring auth.
-  render.yaml healthCheckPath is updated to /healthz.
+Fixes applied (this revision)
+──────────────────────────────
+P2 (CORS wildcard + credentials):
+  allow_origins=["*"] combined with allow_credentials=True is rejected by all
+  modern browsers (CORS spec forbids it) and, even if it were accepted, would
+  allow any origin to make credentialed cross-site requests.  Fixed:
+
+  • ALLOWED_ORIGINS env var controls the list (comma-separated).
+  • Default is the empty string; the app then falls back to a localhost-only
+    list so development still works out of the box.
+  • In production, set ALLOWED_ORIGINS to your exact frontend URL(s):
+      ALLOWED_ORIGINS=https://your-app.onrender.com
+
+  allow_credentials remains True because the session cookie must be sent with
+  API requests from the frontend, but it is now paired with an explicit origin
+  list rather than a wildcard.
+
+Earlier fixes (preserved)
+──────────────────────────
+P6 (Render health check on authenticated endpoint):
+  Added GET /healthz (unauthenticated).
 
 P2 (Double-send under multiple processes):
-  The scheduler is now guarded by an environment variable
-  SCHEDULER_ENABLED (default "true").  When deploying with multiple
-  uvicorn workers (--workers N) set SCHEDULER_ENABLED=false on all but
-  one process, or run the scheduler as a separate Render service.
-  The atomic claim in get_and_claim_scheduled_drafts() provides a
-  second layer of protection within a single-process deployment.
-
-Start with:
-    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+  SCHEDULER_ENABLED guards the background scheduler.
 """
 import os
 from contextlib import asynccontextmanager
@@ -30,9 +38,31 @@ from loguru import logger
 
 load_dotenv()
 
+# ── CORS origins ──────────────────────────────────────────────────────────────
+# Set ALLOWED_ORIGINS to a comma-separated list of your frontend URL(s).
+# Example (Render): ALLOWED_ORIGINS=https://email-agent-admin.onrender.com
+# Example (local):  ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
+#
+# If unset, the app defaults to localhost variants for local development only.
+# The wildcard ("*") is intentionally never used because it cannot be combined
+# with allow_credentials=True and would defeat cookie-based auth.
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
+if _raw_origins:
+    _ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+else:
+    # Safe local-dev default — replace with the real URL before deploying.
+    _ALLOWED_ORIGINS = [
+        "http://localhost:8000",
+        "http://localhost:3000",
+        "http://127.0.0.1:8000",
+        "http://127.0.0.1:3000",
+    ]
+    logger.warning(
+        "ALLOWED_ORIGINS is not set.  CORS is restricted to localhost only. "
+        "Set ALLOWED_ORIGINS=https://your-app-url before deploying to production."
+    )
+
 # ── Scheduler guard ───────────────────────────────────────────────────────────
-# Set SCHEDULER_ENABLED=false in any replica that should NOT run background jobs
-# to prevent duplicate scheduled sends when multiple uvicorn workers are used.
 _SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() not in ("false", "0", "no")
 
 _scheduler = None
@@ -67,7 +97,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Scheduler disabled (SCHEDULER_ENABLED=false).")
 
-    yield  # app runs here
+    yield
 
     if _scheduler:
         _scheduler.shutdown(wait=False)
@@ -84,16 +114,14 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # FIX P2: explicit origin list; wildcard removed.
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # ── Health check (unauthenticated) ────────────────────────────────────────────
-# FIX P6: Render's healthCheckPath must not require auth cookies.
-# /api/auth/me returned 401 to the health checker, causing false restarts.
-
 @app.get("/healthz", include_in_schema=False)
 def healthz():
     return JSONResponse({"status": "ok"})
