@@ -1,24 +1,23 @@
 """
 app/db/models.py  –  Supabase table helpers
 
-Reliability fixes applied
+Fixes applied (this revision)
+──────────────────────────────
+P1 (approve_and_send race condition):
+  Added update_draft_if_status() — an atomic conditional UPDATE that flips a
+  draft's status only when it currently matches an expected set of values.
+  Implemented as UPDATE ... WHERE status IN (...) RETURNING * via the Supabase
+  Python client's .update().in_().execute() with return=representation.
+  Only the one caller whose UPDATE touches a row gets the row back; every
+  other concurrent caller gets an empty result and backs off.
+
+Earlier fixes (preserved)
 ──────────────────────────
 P1 (send_failed invisible):
-  get_pending_drafts() now returns both 'pending' and 'send_failed' drafts so
-  admins can see and retry failed sends from the Pending Approvals page.
+  get_pending_drafts() returns both 'pending' and 'send_failed' drafts.
 
 P2 (double-send):
-  get_and_claim_scheduled_drafts() replaces get_scheduled_drafts().  It uses
-  an atomic update-then-select pattern: it first flips qualifying rows to
-  status='sending', then returns only those updated rows.  A concurrent
-  worker or scheduler tick will not find the same rows because their status
-  has already changed.
-
-  NOTE: Supabase/PostgREST exposes UPDATE...RETURNING via the Python client's
-  .update().eq().execute() which issues a single atomic PATCH with
-  Prefer: return=representation — this is sufficient for single-node
-  deployments.  For multi-replica production use, wrap in a PL/pgSQL
-  function or use SELECT ... FOR UPDATE SKIP LOCKED via a direct SQL call.
+  get_and_claim_scheduled_drafts() uses atomic update-then-select pattern.
 """
 from datetime import datetime, timezone
 from loguru import logger
@@ -161,6 +160,50 @@ def update_draft(draft_id: int, **fields) -> None:
     _db().table("draft_responses").update(fields).eq("id", draft_id).execute()
 
 
+def update_draft_if_status(
+    draft_id: int,
+    from_statuses: tuple[str, ...],
+    **fields,
+) -> dict | None:
+    """
+    Atomic conditional update: set `fields` on draft `draft_id` only when its
+    current status is one of `from_statuses`.  Returns the updated row dict if
+    the condition matched, or None if the row was not updated (status mismatch,
+    or the row does not exist).
+
+    This is the building block for race-free draft claiming.  The Supabase
+    Python client issues a single PATCH with Prefer: return=representation,
+    which is effectively:
+
+        UPDATE draft_responses
+        SET    <fields>
+        WHERE  id = draft_id
+          AND  status = ANY(from_statuses)
+        RETURNING *;
+
+    Only the first concurrent caller whose UPDATE touches the row gets it
+    back; every subsequent caller finds the status has already changed and
+    receives an empty result.
+
+    NOTE: For true serialisable safety across multiple DB replicas or under
+    high concurrency, replace this with a PL/pgSQL function that uses
+    SELECT ... FOR UPDATE SKIP LOCKED.  For the typical single-node Supabase
+    deployment this implementation is sufficient.
+    """
+    try:
+        res = (
+            _db().table("draft_responses")
+            .update(fields)
+            .eq("id", draft_id)
+            .in_("status", list(from_statuses))
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception as exc:
+        logger.error(f"update_draft_if_status({draft_id}) error: {exc}")
+        return None
+
+
 def count_drafts_by_status(status: str) -> int:
     res = _db().table("draft_responses").select("id", count="exact").eq("status", status).execute()
     return res.count or 0
@@ -300,13 +343,9 @@ def get_and_claim_scheduled_drafts() -> list[dict]:
     returning them.  A second scheduler worker or tick will not find these
     rows because their status is no longer 'approved', so they cannot be
     dispatched twice.
-
-    For true serialisable safety on multi-replica deployments, replace this
-    with a PL/pgSQL function using SELECT ... FOR UPDATE SKIP LOCKED.
     """
     now = datetime.now(timezone.utc).isoformat()
     try:
-        # Atomic update: flip to 'sending', get back the updated rows
         res = (
             _db().table("draft_responses")
             .update({"status": "sending"})
