@@ -1,35 +1,40 @@
 """
 app/orchestrator.py  –  Main pipeline orchestrator (Supabase version)
 
-Reliability fixes applied (original)
-──────────────────────────────────────
-P1 (Failed sends invisible):
-  _do_send() sets draft status to 'send_failed' and email status back to
-  'approved' when SMTP fails, instead of leaving records silently in limbo.
+Fixes applied (this revision)
+──────────────────────────────
+P1 (approve_and_send race condition):
+  Two concurrent HTTP requests could both read status='pending', both pass the
+  idempotency guard, and both trigger a send.  Fixed with an atomic conditional
+  update: update_draft_if_status() issues
+      UPDATE draft_responses SET status='sending', approved_at=...
+      WHERE id=? AND status IN ('pending','send_failed') RETURNING *
+  Only one caller wins the row; the other gets back an empty result and returns
+  True immediately (already claimed by the winner).
 
-P1 (Dry-run / missing credentials treated as success):
-  send_email() returns False when credentials are absent (see sender.py).
+P1 (scheduled_send_at not cleared on immediate retry):
+  When a send_failed draft was retried with force_immediate=True (or with no
+  timer), approve_and_send() set status='approved' but left the old
+  scheduled_send_at in place.  On the next scheduler tick the draft would
+  appear due and dispatch_scheduled_drafts() would claim it again, causing a
+  double-send.  Fixed: the immediate path now always passes
+  scheduled_send_at=None to update_draft so any stale timestamp is cleared.
+
+Earlier fixes (preserved)
+──────────────────────────
+P1 (Failed sends invisible):
+  _do_send() sets draft to 'send_failed' / email back to 'approved' on SMTP
+  failure.
+
+P1 (Dry-run / missing credentials):
+  send_email() returns False when credentials absent (see sender.py).
 
 P2 (Double-send under multiple workers):
-  dispatch_scheduled_drafts() uses an atomic claim via
-  get_and_claim_scheduled_drafts() in models.py.
-
-Additional fixes applied
-────────────────────────
-P1 (approve_and_send not idempotent):
-  approve_and_send() now checks the draft's current status before proceeding.
-  Only drafts in 'pending' or 'send_failed' state are approved; any other
-  status (already sent, already approved/scheduled, rejected) causes an early
-  return so that double-clicks, network retries, and repeated API calls cannot
-  trigger a second email send.
+  dispatch_scheduled_drafts() uses atomic get_and_claim_scheduled_drafts().
 
 P2 (MAX_REPEAT_COUNT ignored):
-  run_pipeline() previously routed to manual on the very first repeat of the
-  same query type from a sender (threshold was effectively 1).
-  MAX_REPEAT_COUNT is now read live from the DB / env and used as the actual
-  threshold: a sender must have >= MAX_REPEAT_COUNT prior emails of the same
-  query type before that email is held for manual review. This matches the
-  documented intent of the setting.
+  run_pipeline() reads the live setting and routes to manual only after
+  >= MAX_REPEAT_COUNT prior emails of the same query type.
 """
 import os
 from datetime import datetime, timezone, timedelta
@@ -38,7 +43,8 @@ from loguru import logger
 from app.db.models import (
     get_email_by_id, update_email_status, update_email_query_type,
     get_template_by_query_type, insert_draft, insert_log,
-    get_draft_by_id, update_draft, get_and_claim_scheduled_drafts,
+    get_draft_by_id, update_draft, update_draft_if_status,
+    get_and_claim_scheduled_drafts,
     count_emails_by_sender_and_query,
 )
 from app.email.poller import poll_inbox
@@ -48,11 +54,6 @@ from app.ai.generator import classify_email, generate_draft
 # ── Config helpers ─────────────────────────────────────────────────────────────
 
 def _get_max_repeat_count() -> int:
-    """
-    Read MAX_REPEAT_COUNT from app_settings (live DB) with .env / default fallback.
-    Returns the integer threshold — a sender must have this many prior emails of
-    the same query type before the current email is routed to the manual queue.
-    """
     try:
         from app.db.models import get_setting
         val = get_setting("MAX_REPEAT_COUNT")
@@ -79,7 +80,6 @@ def run_pipeline():
             if not record:
                 continue
 
-            # Note: no trailing comma — these are plain strings, not tuples.
             sender  = record["sender"]
             subject = record.get("subject") or ""
             body    = record.get("body") or ""
@@ -88,11 +88,6 @@ def run_pipeline():
             query_type = classification["query_type"]
             update_email_query_type(record["id"], query_type)
 
-            # FIX P2: Apply MAX_REPEAT_COUNT as the actual routing threshold.
-            # Previously `prior_same_query > 0` meant the very first repeat
-            # triggered manual routing regardless of the setting value.
-            # Now the sender must have >= max_repeats prior emails of the same
-            # query type before this one is held for manual review.
             prior_same_query = count_emails_by_sender_and_query(
                 sender, query_type, exclude_email_id=record["id"]
             )
@@ -148,9 +143,8 @@ def _do_send(draft_id: int, draft: dict, record: dict) -> bool:
     """
     Internal: call send_email and update DB records on success or failure.
 
-    Precondition: the draft's status has already been set to 'approved' (or
-    'sending' for scheduled) by the caller so it no longer appears in the
-    pending list regardless of send outcome.
+    Precondition: the draft's status has already been atomically set to
+    'sending' by the caller so no other worker can claim the same draft.
 
     On SMTP failure the draft is moved to 'send_failed' and the email back to
     'approved', making both visible for admin retry.
@@ -171,7 +165,6 @@ def _do_send(draft_id: int, draft: dict, record: dict) -> bool:
         logger.success(f"Draft {draft_id} sent successfully.")
         return True
 
-    # Mark as 'send_failed' so admins can see and retry from Pending Approvals.
     logger.error(f"_do_send: send_email returned False for draft {draft_id}")
     update_draft(draft_id, status="send_failed")
     update_email_status(record["id"], "approved")
@@ -185,44 +178,66 @@ def approve_and_send(draft_id: int, force_immediate: bool = False) -> bool:
     """
     Approve a draft and send or schedule it.
 
-    FIX P1 (idempotency):
-    The draft's current status is checked before any action is taken.
-    Only 'pending' and 'send_failed' drafts can be approved — all other
-    statuses (sent, approved/scheduled, rejected, sending) cause an early
-    return so that double-clicks, network retries, or repeated API calls
-    cannot trigger a second email send.
+    FIX P1 (atomic claim — replaces optimistic status check):
+    Instead of read-then-check-then-write (which has a TOCTOU race window),
+    this function issues a single conditional UPDATE:
+        UPDATE draft_responses
+        SET status='sending', approved_at=NOW()
+        WHERE id=? AND status IN ('pending','send_failed')
+        RETURNING *
+    Only one concurrent caller wins the row.  The loser gets back an empty
+    result and returns True immediately (the winner already handled it).
+    This eliminates the double-send window entirely within a single DB node.
 
-    • If force_immediate=True, bypasses any template timer and sends right away.
-    • If the matching template has send_delay_seconds set (and force_immediate
-      is False), the draft is scheduled.
-    • Otherwise sends immediately.
+    FIX P1 (scheduled_send_at cleared on immediate retry):
+    The immediate send path now explicitly passes scheduled_send_at=None so
+    that any stale timestamp from a previous scheduled approval is cleared,
+    preventing dispatch_scheduled_drafts() from picking up the same draft.
 
     Returns True on success (sent or scheduled), False on hard failure.
     """
+    now = datetime.now(timezone.utc).isoformat()
+
+    # ── Atomic claim ──────────────────────────────────────────────────────────
+    # Flip status to 'sending' only if the current status is one we own.
+    # update_draft_if_status() returns the updated row or None if the condition
+    # was not met (another worker already claimed or the draft is in a terminal
+    # state like 'sent' / 'rejected').
+    claimed = update_draft_if_status(
+        draft_id,
+        from_statuses=("pending", "send_failed"),
+        status="sending",
+        approved_at=now,
+    )
+    if claimed is None:
+        # Either the draft does not exist or it's already been handled.
+        # Fetch the current record to decide how to respond to the caller.
+        draft = get_draft_by_id(draft_id)
+        if not draft:
+            logger.error(f"approve_and_send: draft {draft_id} not found in DB")
+            return False
+        current = draft.get("status")
+        logger.warning(
+            f"approve_and_send: draft {draft_id} has status '{current}' "
+            f"— skipping (already claimed or terminal state)."
+        )
+        # Return True so the HTTP caller doesn't surface a spurious error for
+        # a draft that was already approved/sent by a concurrent request.
+        return True
+
+    # We own the draft — fetch the full row (claimed contains the updated fields
+    # but may be a partial dict depending on the Supabase client version).
     draft = get_draft_by_id(draft_id)
     if not draft:
-        logger.error(f"approve_and_send: draft {draft_id} not found in DB")
+        logger.error(f"approve_and_send: draft {draft_id} vanished after claim")
         return False
-
-    # FIX P1: Idempotency guard — only act on drafts that need to be approved.
-    # 'pending'     → normal approval flow.
-    # 'send_failed' → admin is retrying a previously failed send; allow it.
-    # Any other status (sent, approved, sending, rejected) → already handled;
-    # return True so the caller doesn't surface a spurious error.
-    current_status = draft.get("status")
-    if current_status not in ("pending", "send_failed"):
-        logger.warning(
-            f"approve_and_send: draft {draft_id} has status '{current_status}' "
-            f"— skipping to prevent duplicate action."
-        )
-        return True
 
     record = get_email_by_id(draft["email_id"])
     if not record:
         logger.error(f"approve_and_send: email {draft['email_id']} not found in DB")
+        update_draft(draft_id, status="send_failed")
         return False
 
-    now        = datetime.now(timezone.utc).isoformat()
     query_type = record.get("query_type") or "general"
     tmpl       = get_template_by_query_type(query_type)
     delay_secs = tmpl.get("send_delay_seconds") if tmpl else None
@@ -232,8 +247,8 @@ def approve_and_send(draft_id: int, force_immediate: bool = False) -> bool:
         send_at = (
             datetime.now(timezone.utc) + timedelta(seconds=int(delay_secs))
         ).isoformat()
-        update_draft(draft_id, status="approved", approved_at=now,
-                     scheduled_send_at=send_at)
+        # Move from 'sending' → 'approved' with a scheduled timestamp.
+        update_draft(draft_id, status="approved", scheduled_send_at=send_at)
         update_email_status(record["id"], "approved")
         insert_log(
             record["id"], "email_scheduled",
@@ -248,7 +263,11 @@ def approve_and_send(draft_id: int, force_immediate: bool = False) -> bool:
         insert_log(record["id"], "timer_overridden",
                    f"Draft {draft_id} sent immediately despite {delay_secs}s timer.")
 
-    update_draft(draft_id, status="approved", approved_at=now)
+    # FIX P1: clear any stale scheduled_send_at so the scheduler cannot
+    # double-claim this draft after an immediate send.  Status is already
+    # 'sending' from the atomic claim above — do not re-set it here to avoid
+    # an unnecessary DB round-trip that could mask the claim state.
+    update_draft(draft_id, scheduled_send_at=None)
     update_email_status(record["id"], "approved")
 
     return _do_send(draft_id, draft, record)
@@ -273,7 +292,6 @@ def dispatch_scheduled_drafts():
             logger.warning(
                 f"Scheduled draft {draft['id']}: email record missing, skipping."
             )
-            # Return to approved so it can be investigated / retried.
             update_draft(draft["id"], status="approved")
             continue
         _do_send(draft["id"], draft, record)
