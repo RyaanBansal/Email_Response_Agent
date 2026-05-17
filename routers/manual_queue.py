@@ -5,8 +5,19 @@ GET  /api/manual                        → list emails in manual status
 POST /api/manual/{email_id}/generate    → force-generate an AI draft (with template) for a manual email
 POST /api/manual/{email_id}/reply       → submit a manually typed response and send it
 
-Reliability fix applied
-────────────────────────
+Reliability fixes applied
+─────────────────────────
+P1 (Manual endpoints can resend or mutate already-handled emails):
+  generate_for_manual() and submit_manual_reply() previously fetched the email
+  record but never verified its current status before acting.  A direct API
+  call (or a stale browser tab) could:
+    • generate a new pending draft for an email already marked sent/rejected, or
+    • fire a second SMTP send for an email already delivered.
+
+  Fix: both endpoints now assert the email is in 'manual' status before
+  proceeding.  Any other status returns 409 Conflict so the caller knows the
+  record has already been handled.
+
 P2 (Manual reply SMTP failures disappear from retry queues):
   submit_manual_reply() previously marked the draft 'approved' and the email
   'approved' before calling send_email().  On SMTP failure it logged and
@@ -37,6 +48,37 @@ from routers.auth import get_current_user
 
 router = APIRouter(prefix="/api/manual", tags=["manual_queue"])
 
+# Only emails in 'manual' status may be processed by the manual-queue endpoints.
+# Any other status (pending, approved, sent, rejected) returns 409 Conflict.
+_MANUAL_STATUSES = {"manual"}
+
+
+def _assert_manual(email_id: int) -> dict:
+    """
+    Fetch the email record and raise 404 / 409 if it is not in a state that
+    the manual-queue endpoints are allowed to act on.
+
+    Returns the record dict on success.
+
+    FIX P1: Prevents generate_for_manual() and submit_manual_reply() from
+    re-processing emails that have already been sent, rejected, or approved
+    by a concurrent request or a stale browser tab.
+    """
+    record = get_email_by_id(email_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Email not found")
+    status = record.get("status", "")
+    if status not in _MANUAL_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Email {email_id} is in '{status}' state and cannot be processed "
+                f"by the manual queue. Only emails in {sorted(_MANUAL_STATUSES)} "
+                f"may be acted on here."
+            ),
+        )
+    return record
+
 
 @router.get("")
 def list_manual(_user=Depends(get_current_user)):
@@ -52,10 +94,12 @@ def generate_for_manual(email_id: int, _user=Depends(get_current_user)):
     Applies the same template wrapper used by the main pipeline so that the
     draft stored in the DB — and shown in Pending Approvals — is the complete
     formatted email, not just the bare AI-generated body.
+
+    FIX P1: Asserts the email is in 'manual' status before generating a draft.
+    Returns 409 if the email has already been handled.
     """
-    record = get_email_by_id(email_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Email not found")
+    # FIX P1: status guard — replaces bare get_email_by_id() + no check
+    record = _assert_manual(email_id)
 
     result = process_email(
         sender  = record["sender"],
@@ -90,20 +134,22 @@ def submit_manual_reply(email_id: int, payload: ManualReplyBody, _user=Depends(g
     Send a fully manual reply typed by the admin.
 
     Workflow:
-      1. Validate the email exists and is in manual (or pending) status.
+      1. Validate the email exists and is in 'manual' status (FIX P1).
       2. Insert a draft record with confidence=1.0 (human-written).
       3. Mark the draft/email 'approved' then attempt SMTP send.
       4a. On success: mark both 'sent'.
       4b. On failure: roll back draft to 'pending' and email to 'manual' so
           the admin can retry from Pending Approvals or the Manual Queue.
 
+    FIX P1: Returns 409 if the email is not in 'manual' status, preventing
+    double-sends from stale tabs or direct API calls.
+
     FIX P2: Previously a failed send left the draft in 'approved' state which
     is not surfaced by any UI queue, making it impossible to retry without
     direct DB access.
     """
-    record = get_email_by_id(email_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Email not found")
+    # FIX P1: status guard — replaces bare get_email_by_id() + no check
+    record = _assert_manual(email_id)
 
     if not payload.body or not payload.body.strip():
         raise HTTPException(status_code=400, detail="Reply body cannot be empty.")
