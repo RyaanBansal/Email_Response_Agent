@@ -3,23 +3,25 @@ main.py  –  FastAPI entry point for the Agentic Email System
 
 Fixes applied (this revision)
 ──────────────────────────────
-P2 (CORS wildcard + credentials):
-  allow_origins=["*"] combined with allow_credentials=True is rejected by all
-  modern browsers (CORS spec forbids it) and, even if it were accepted, would
-  allow any origin to make credentialed cross-site requests.  Fixed:
+P2 (Unknown /api/ GET routes return the SPA with 200):
+  The catch-all route previously matched every unmatched GET path, including
+  paths under /api/.  A typo like GET /api/apporvals would silently return the
+  HTML page with status 200, making misrouted API calls impossible to detect
+  from the response alone and breaking clients that check for JSON.
 
-  • ALLOWED_ORIGINS env var controls the list (comma-separated).
-  • Default is the empty string; the app then falls back to a localhost-only
-    list so development still works out of the box.
-  • In production, set ALLOWED_ORIGINS to your exact frontend URL(s):
-      ALLOWED_ORIGINS=https://your-app.onrender.com
-
-  allow_credentials remains True because the session cookie must be sent with
-  API requests from the frontend, but it is now paired with an explicit origin
-  list rather than a wildcard.
+  Fix: the catch-all handler now returns a 404 JSON response for any path that
+  starts with "api/" (the leading slash is stripped by FastAPI's path
+  parameter).  Only genuine frontend navigation paths (no "api/" prefix) are
+  served the SPA.  This keeps SPA deep-linking intact (e.g. /dashboard) while
+  surfacing real 404s for unknown API routes.
 
 Earlier fixes (preserved)
 ──────────────────────────
+P2 (CORS wildcard + credentials):
+  allow_origins=["*"] combined with allow_credentials=True is rejected by all
+  modern browsers (CORS spec forbids it).  Fixed: ALLOWED_ORIGINS env var
+  controls the list; defaults to localhost-only for development.
+
 P6 (Render health check on authenticated endpoint):
   Added GET /healthz (unauthenticated).
 
@@ -39,18 +41,10 @@ from loguru import logger
 load_dotenv()
 
 # ── CORS origins ──────────────────────────────────────────────────────────────
-# Set ALLOWED_ORIGINS to a comma-separated list of your frontend URL(s).
-# Example (Render): ALLOWED_ORIGINS=https://email-agent-admin.onrender.com
-# Example (local):  ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
-#
-# If unset, the app defaults to localhost variants for local development only.
-# The wildcard ("*") is intentionally never used because it cannot be combined
-# with allow_credentials=True and would defeat cookie-based auth.
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
 if _raw_origins:
     _ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 else:
-    # Safe local-dev default — replace with the real URL before deploying.
     _ALLOWED_ORIGINS = [
         "http://localhost:8000",
         "http://localhost:3000",
@@ -114,7 +108,6 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    # FIX P2: explicit origin list; wildcard removed.
     allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -151,6 +144,27 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.get("/", include_in_schema=False)
+def serve_root():
+    return FileResponse("static/index.html")
+
+
 @app.get("/{full_path:path}", include_in_schema=False)
 def serve_spa(full_path: str = ""):
+    # FIX P2a: Do NOT serve the SPA for unmatched /api/ paths.
+    #
+    # FastAPI strips the leading slash before populating full_path, so a
+    # request for /api/apporvals arrives here as full_path="api/apporvals".
+    # Returning a 200 HTML page for such paths silently swallowed typos and
+    # made missing API routes impossible to detect from the response.
+    #
+    # Return a proper 404 JSON response instead so clients (and developers)
+    # get an unambiguous signal that the endpoint does not exist.
+    if full_path.startswith("api/") or full_path == "api":
+        return JSONResponse(
+            status_code=404,
+            content={"detail": f"API route not found: /{full_path}"},
+        )
+
+    # All other paths are legitimate SPA deep-links (e.g. /dashboard,
+    # /settings).  Serve the shell and let the frontend router handle them.
     return FileResponse("static/index.html")
