@@ -3,16 +3,18 @@ app/db/models.py  –  Supabase table helpers
 
 Fixes applied (this revision)
 ──────────────────────────────
-P1 (approve_and_send race condition):
-  Added update_draft_if_status() — an atomic conditional UPDATE that flips a
-  draft's status only when it currently matches an expected set of values.
-  Implemented as UPDATE ... WHERE status IN (...) RETURNING * via the Supabase
-  Python client's .update().in_().execute() with return=representation.
-  Only the one caller whose UPDATE touches a row gets the row back; every
-  other concurrent caller gets an empty result and backs off.
+P1 (Stranded emails after ingestion errors):
+  Added get_pending_emails_without_draft() — returns 'pending' emails that have
+  no associated draft_responses row.  Used by run_pipeline() to recover emails
+  whose draft-generation step failed in a previous run so they are retried
+  automatically rather than silently abandoned.
 
 Earlier fixes (preserved)
 ──────────────────────────
+P1 (approve_and_send race condition):
+  Added update_draft_if_status() — an atomic conditional UPDATE that flips a
+  draft's status only when it currently matches an expected set of values.
+
 P1 (send_failed invisible):
   get_pending_drafts() returns both 'pending' and 'send_failed' drafts.
 
@@ -108,6 +110,55 @@ def count_emails_received_today() -> int:
         .execute()
     )
     return res.count or 0
+
+
+def get_pending_emails_without_draft() -> list[dict]:
+    """
+    Return 'pending' emails that have no associated draft_responses row.
+
+    FIX P1b (stranded emails):
+    These are emails that were inserted by poll_inbox() but whose downstream
+    processing (classification, draft generation, DB insert) failed before a
+    draft record could be created.  run_pipeline() calls this each run so that
+    stranded emails are automatically retried rather than silently abandoned.
+
+    Implementation note: Supabase PostgREST does not expose a native anti-join
+    directly, so we fetch pending email IDs and the set of email IDs that have
+    at least one draft, then compute the difference in Python.  For typical
+    support-inbox volumes (hundreds to low-thousands of rows) this is
+    perfectly efficient.  If the table grows to tens of thousands of pending
+    rows, replace this with a DB-side NOT EXISTS subquery via an RPC function.
+    """
+    try:
+        # All pending email IDs.
+        pending_res = (
+            _db().table("emails")
+            .select("*")
+            .eq("status", "pending")
+            .order("received_at", desc=True)
+            .execute()
+        )
+        pending_rows: list[dict] = pending_res.data or []
+        if not pending_rows:
+            return []
+
+        pending_ids = [r["id"] for r in pending_rows]
+
+        # Email IDs that already have at least one draft (any status).
+        drafted_res = (
+            _db().table("draft_responses")
+            .select("email_id")
+            .in_("email_id", pending_ids)
+            .execute()
+        )
+        drafted_ids: set[int] = {r["email_id"] for r in (drafted_res.data or [])}
+
+        # Return only emails with no draft record.
+        return [r for r in pending_rows if r["id"] not in drafted_ids]
+
+    except Exception as exc:
+        logger.error(f"get_pending_emails_without_draft error: {exc}")
+        return []
 
 
 # ══════════════════════════════════════════════════════════════════════════════
