@@ -5,6 +5,30 @@ GET  /api/settings            → return all settings as a flat dict
 POST /api/settings            → bulk-save settings dict
 POST /api/settings/test-smtp  → test SMTP connection with current values
 POST /api/settings/run-pipeline → manually trigger the email pipeline
+
+Fix applied (this revision)
+────────────────────────────
+P1 (Invalid integer settings stored, crash later in critical sections):
+  POST /api/settings previously accepted any string without validation.
+  Integer-typed settings (IMAP_PORT, SMTP_PORT, POLL_INTERVAL_SECONDS,
+  MAX_REPEAT_COUNT) are consumed with int() in hot paths including send_email(),
+  poll_inbox(), and approve_and_send().  A bad value (e.g. "587x", "abc")
+  causes ValueError; in the worst case that happens after a draft has been
+  claimed as 'sending', permanently hiding it.
+
+  Fix: save_settings() runs a validation pass over all integer-typed keys
+  before writing anything.  Invalid values produce a 422 with a clear message
+  listing every offending key; no values are persisted until all pass.
+
+  Validation rules match the constraints already documented in render.yaml
+  and enforced by the UI number inputs:
+    IMAP_PORT              1–65535
+    SMTP_PORT              1–65535
+    POLL_INTERVAL_SECONDS  10–86400
+    MAX_REPEAT_COUNT       ≥ 1
+
+  Empty strings are skipped (treated as "leave unchanged") so partial saves
+  that intentionally omit a key continue to work.
 """
 import os
 import smtplib
@@ -24,6 +48,15 @@ _SETTING_KEYS = [
     "POLL_INTERVAL_SECONDS", "MAX_REPEAT_COUNT", "GEMINI_MODEL",
 ]
 
+# Integer-typed settings and their allowed ranges: key → (min, max | None).
+# None for max means unbounded above.
+_INT_SETTINGS: dict[str, tuple[int, int | None]] = {
+    "IMAP_PORT":             (1, 65535),
+    "SMTP_PORT":             (1, 65535),
+    "POLL_INTERVAL_SECONDS": (10, 86400),
+    "MAX_REPEAT_COUNT":      (1, None),
+}
+
 
 def _sval(key: str, default: str = "") -> str:
     val = get_setting(key)
@@ -36,7 +69,6 @@ def _sval(key: str, default: str = "") -> str:
 def get_settings(_user=Depends(get_current_user)):
     rows = get_all_settings()
     db_dict = {r["key"]: r["value"] for r in rows}
-    # Merge with env defaults for display; mask password
     result = {}
     for key in _SETTING_KEYS:
         result[key] = db_dict.get(key) or os.getenv(key, "")
@@ -50,12 +82,60 @@ class SettingsPayload(BaseModel):
 
 @router.post("")
 def save_settings(payload: SettingsPayload, _user=Depends(get_current_user)):
+    """
+    Validate then persist settings.
+
+    FIX P1: All integer-typed settings are validated before any DB writes.
+    If any value is invalid the entire request is rejected (422) and nothing
+    is persisted, so the DB is never left in a partially-updated state.
+    """
+    # ── Validation pass — no writes until all checks pass ────────────────────
+    errors: list[str] = []
+
+    for key, (min_val, max_val) in _INT_SETTINGS.items():
+        raw = payload.settings.get(key)
+        if raw is None:
+            continue            # key absent from payload — not being changed
+        raw = raw.strip()
+        if raw == "":
+            continue            # empty → leave existing value unchanged
+
+        try:
+            parsed = int(raw)
+        except (ValueError, TypeError):
+            errors.append(f"{key}: '{raw}' is not a valid integer.")
+            continue
+
+        if parsed < min_val:
+            errors.append(
+                f"{key}: {parsed} is below the minimum allowed value ({min_val})."
+            )
+        if max_val is not None and parsed > max_val:
+            errors.append(
+                f"{key}: {parsed} exceeds the maximum allowed value ({max_val})."
+            )
+
+    if errors:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Invalid settings — no changes were saved:\n"
+                + "\n".join(f"  • {e}" for e in errors)
+            ),
+        )
+
+    # ── Write pass — all values have passed validation ────────────────────────
     for key, val in payload.settings.items():
-        if key in _SETTING_KEYS:
-            # Don't overwrite the masked password placeholder
-            if key == "EMAIL_PASSWORD" and val == "••••••••":
-                continue
-            set_setting(key, val)
+        if key not in _SETTING_KEYS:
+            continue
+        # Never overwrite a real password with the masked placeholder.
+        if key == "EMAIL_PASSWORD" and val == "••••••••":
+            continue
+        # Don't write an empty string for integer fields (skip, not overwrite).
+        if key in _INT_SETTINGS and val.strip() == "":
+            continue
+        set_setting(key, val)
+
     return {"detail": "Settings saved"}
 
 
