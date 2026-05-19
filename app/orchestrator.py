@@ -3,49 +3,35 @@ app/orchestrator.py  –  Main pipeline orchestrator (Supabase version)
 
 Fixes applied (this revision)
 ──────────────────────────────
-P1 (Stranded emails after ingestion errors):
-  run_pipeline() previously only processed emails returned by the current
-  poll_inbox() call.  If draft generation, template lookup, or DB work failed
-  for an email, it was silently abandoned: later pipeline runs would never
-  see it again because it remained in 'pending' status with no draft but was
-  not re-fetched.
+P1 (Stale 'sending' drafts permanently hidden):
+  run_pipeline() calls recover_stale_sending_drafts() at the start of every
+  pass.  Any draft stuck in 'sending' for longer than SENDING_TIMEOUT_MINUTES
+  (10 min) is reset to 'send_failed' with the parent email back to 'approved',
+  making both visible in Pending Approvals for admin retry.
 
-  Fix: run_pipeline() now also queries for any 'pending' emails that have no
-  associated draft (i.e. draft generation was never completed).  These are
-  merged with the freshly polled batch so every run acts as its own recovery
-  pass.  A new helper get_pending_emails_without_draft() is added to models.py.
+P1 (int() on live settings can raise inside critical sections):
+  _get_max_repeat_count() and approve_and_send() used bare int() on values
+  read from app_settings.  A bad stored value (e.g. "3x") would raise
+  ValueError mid-flight.  In approve_and_send() that could happen after the
+  draft was already claimed as 'sending', leaving it permanently hidden.
+  Both callers now use _safe_int() which falls back to a sensible default and
+  logs a warning instead of raising.
 
-P2 (Template subject lines ignored when sending):
-  _do_send() always composed the outbound subject as "Re: <original subject>",
-  ignoring the subject field that admins set on response templates.  Changes
-  saved in the Templates UI had no effect on delivered email subjects.
-
-  Fix: _do_send() now accepts an optional override_subject parameter.
-  approve_and_send() looks up the template for the email's query_type and
-  passes its subject (when non-empty) to _do_send().  The "Re: …" fallback is
-  kept when no template subject is set so existing behaviour is preserved.
+P2 (update_draft_if_status DB errors silently treated as success):
+  The function now returns the _DB_ERROR sentinel on exception.
+  approve_and_send() checks for it explicitly and returns False so the API
+  endpoint raises HTTP 500 and the admin sees the failure rather than a
+  spurious "Approved" toast.
 
 Earlier fixes (preserved)
 ──────────────────────────
-P1 (approve_and_send race condition):
-  Atomic conditional UPDATE via update_draft_if_status() prevents double-send.
-
-P1 (scheduled_send_at not cleared on immediate retry):
-  Immediate path always passes scheduled_send_at=None.
-
-P1 (Failed sends invisible):
-  _do_send() sets draft to 'send_failed' / email back to 'approved' on SMTP
-  failure.
-
-P1 (Dry-run / missing credentials):
-  send_email() returns False when credentials absent (see sender.py).
-
-P2 (Double-send under multiple workers):
-  dispatch_scheduled_drafts() uses atomic get_and_claim_scheduled_drafts().
-
-P2 (MAX_REPEAT_COUNT ignored):
-  run_pipeline() reads the live setting and routes to manual only after
-  >= MAX_REPEAT_COUNT prior emails of the same query type.
+P1 (stranded emails): run_pipeline() recovers pending emails with no draft.
+P2 (template subject): _do_send() uses the template subject when available.
+P1 (race condition / double-send): atomic claim via update_draft_if_status().
+P1 (scheduled_send_at cleared on immediate retry).
+P1 (failed sends visible as send_failed).
+P2 (double-send under multiple workers).
+P2 (MAX_REPEAT_COUNT respected).
 """
 import os
 from datetime import datetime, timezone, timedelta
@@ -57,23 +43,45 @@ from app.db.models import (
     get_draft_by_id, update_draft, update_draft_if_status,
     get_and_claim_scheduled_drafts,
     count_emails_by_sender_and_query,
-    get_pending_emails_without_draft,   # FIX P1b: new helper
+    get_pending_emails_without_draft,
+    recover_stale_sending_drafts,
+    _DB_ERROR,
+    _DbErrorType,
 )
 from app.email.poller import poll_inbox
 from app.ai.generator import classify_email, generate_draft
 
 
-# ── Config helpers ─────────────────────────────────────────────────────────────
+# ── Internal helpers ───────────────────────────────────────────────────────────
+
+def _safe_int(value: str, default: int, label: str) -> int:
+    """
+    Parse value as int, returning default on failure.
+
+    FIX P1: Replaces bare int() calls on live-settings values so that a bad
+    stored value (e.g. "3x") never raises ValueError inside a critical section
+    that has already mutated state (e.g. after claiming a draft as 'sending').
+    """
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        logger.warning(
+            f"orchestrator: {label}={value!r} is not a valid integer; "
+            f"using default {default}."
+        )
+        return default
+
 
 def _get_max_repeat_count() -> int:
     try:
         from app.db.models import get_setting
         val = get_setting("MAX_REPEAT_COUNT")
         if val:
-            return int(val)
+            # FIX P1: was bare int(val) — raises ValueError on bad stored value.
+            return _safe_int(val, 3, "MAX_REPEAT_COUNT")
     except Exception:
         pass
-    return int(os.getenv("MAX_REPEAT_COUNT", "3"))
+    return _safe_int(os.getenv("MAX_REPEAT_COUNT", "3"), 3, "MAX_REPEAT_COUNT")
 
 
 # ── Pipeline ───────────────────────────────────────────────────────────────────
@@ -81,9 +89,8 @@ def _get_max_repeat_count() -> int:
 def _process_email_record(record: dict, max_repeats: int) -> None:
     """
     Classify, route, draft, and insert a log entry for a single email record.
-
-    Extracted from run_pipeline() so that both the fresh-poll path and the
-    stranded-email recovery path share identical logic.
+    Extracted so that both the fresh-poll path and stranded-email recovery
+    share identical logic.
     """
     email_id = record["id"]
     sender   = record["sender"]
@@ -104,7 +111,7 @@ def _process_email_record(record: dict, max_repeats: int) -> None:
             email_id, "routed_manual",
             f"Repeat query ({query_type}) from {sender} "
             f"— {prior_same_query} prior email(s) with same query type "
-            f"(threshold: {max_repeats})."
+            f"(threshold: {max_repeats}).",
         )
         logger.info(
             f"Email {email_id} → manual queue "
@@ -137,31 +144,36 @@ def _process_email_record(record: dict, max_repeats: int) -> None:
     logger.success(f"Draft generated for email {email_id} ({query_type})")
 
 
-def run_pipeline():
+def run_pipeline() -> None:
     """
-    Poll for new emails AND recover any previously stranded pending emails,
-    then process all of them through classification → draft → log.
+    Poll for new emails, recover stale/stranded records, then process
+    everything through classification → draft → log.
 
-    FIX P1b (stranded emails):
-    After collecting fresh emails from the IMAP inbox, we also query the DB for
-    any 'pending' emails that have no draft record yet.  This covers emails
-    whose draft-generation step failed in a previous run (exception, API
-    timeout, DB error, etc.).  Both sets are merged (deduped by ID) and
-    processed together, so every pipeline run doubles as a recovery pass.
+    FIX P1 (stale 'sending' drafts):
+    Calls recover_stale_sending_drafts() first so any draft left in 'sending'
+    by a previous crashed run is promoted to 'send_failed' before the rest of
+    the pipeline runs.
+
+    FIX P1 (stranded emails — earlier fix, preserved):
+    Also queries for 'pending' emails with no draft and merges them into the
+    current batch for automatic retry.
     """
     logger.info("─── Pipeline run started ───")
 
-    # 1. Poll IMAP for new unseen messages.
+    # FIX P1: recover drafts stuck in 'sending' from a previous crashed run.
+    recover_stale_sending_drafts()
+
+    # Poll IMAP for new unseen messages.
     new_emails = poll_inbox()
     new_ids: set[int] = {e["id"] for e in new_emails}
 
-    # 2. FIX P1b: also recover emails that are stuck in 'pending' with no draft.
+    # FIX P1b (earlier): recover 'pending' emails with no draft.
     stranded = get_pending_emails_without_draft()
-    recovered = [e for e in stranded if e["id"] not in new_ids]
-    if recovered:
+    recovered_emails = [e for e in stranded if e["id"] not in new_ids]
+    if recovered_emails:
         logger.info(
-            f"Recovering {len(recovered)} stranded pending email(s) "
-            f"with no draft: {[e['id'] for e in recovered]}"
+            f"Recovering {len(recovered_emails)} stranded pending email(s) "
+            f"with no draft: {[e['id'] for e in recovered_emails]}"
         )
 
     # Merge: process fresh emails first, then stranded ones.
@@ -170,7 +182,7 @@ def run_pipeline():
         record = get_email_by_id(e["id"])
         if record:
             to_process.append(record)
-    to_process.extend(recovered)
+    to_process.extend(recovered_emails)
 
     if not to_process:
         logger.info("No new or stranded emails to process.")
@@ -183,45 +195,45 @@ def run_pipeline():
             _process_email_record(record, max_repeats)
         except Exception as exc:
             logger.error(f"Pipeline error on email {record.get('id')}: {exc}")
-            # Leave the email in 'pending' so the next run can retry it.
-            # We intentionally do NOT change its status here; the email will
-            # be picked up again by get_pending_emails_without_draft().
+            # Leave the email in 'pending'; next run retries via
+            # get_pending_emails_without_draft().
 
     logger.info("─── Pipeline run complete ───")
 
 
 # ── Send helpers ───────────────────────────────────────────────────────────────
 
-def _do_send(draft_id: int, draft: dict, record: dict,
-             override_subject: str | None = None) -> bool:
+def _do_send(
+    draft_id: int,
+    draft: dict,
+    record: dict,
+    override_subject: str | None = None,
+) -> bool:
     """
-    Internal: call send_email and update DB records on success or failure.
+    Call send_email() and update DB records on success or failure.
 
-    Precondition: the draft's status has already been atomically set to
-    'sending' by the caller so no other worker can claim the same draft.
+    Precondition: the caller has already atomically set status='sending' so no
+    other worker can claim the same draft.
 
-    FIX P2b (template subject used when sending):
-    Accepts an optional override_subject.  When provided (and non-empty) it is
-    used as the outbound email subject instead of the "Re: <original>" fallback.
-    approve_and_send() passes the template's subject field here so admin edits
-    in the Templates UI are actually reflected in delivered emails.
+    FIX P2b (template subject — earlier fix, preserved):
+    Uses override_subject when provided so admin-configured subject lines are
+    actually delivered rather than always falling back to "Re: <original>".
 
     On SMTP failure the draft is moved to 'send_failed' and the email back to
-    'approved', making both visible for admin retry.
+    'approved' so both are visible in Pending Approvals for admin retry.
     """
     from app.email.sender import send_email
 
     body_to_send = draft.get("edited_body") or draft.get("draft_body") or ""
-
-    # FIX P2b: prefer template subject over the "Re: …" fallback.
-    if override_subject and override_subject.strip():
-        subject = override_subject.strip()
-    else:
-        subject = f"Re: {record.get('subject') or 'Your Inquiry'}"
+    subject = (
+        override_subject.strip()
+        if override_subject and override_subject.strip()
+        else f"Re: {record.get('subject') or 'Your Inquiry'}"
+    )
 
     now = datetime.now(timezone.utc).isoformat()
-
     logger.info(f"Sending draft {draft_id} to {record['sender']} | Subject: {subject}")
+
     sent = send_email(to=record["sender"], subject=subject, body=body_to_send)
 
     if sent:
@@ -234,30 +246,32 @@ def _do_send(draft_id: int, draft: dict, record: dict,
     logger.error(f"_do_send: send_email returned False for draft {draft_id}")
     update_draft(draft_id, status="send_failed")
     update_email_status(record["id"], "approved")
-    insert_log(record["id"], "send_failed",
-               f"Draft {draft_id} failed to send — check SMTP config. "
-               f"Draft is in 'send_failed' state and can be retried from Pending Approvals.")
+    insert_log(
+        record["id"], "send_failed",
+        f"Draft {draft_id} failed to send — check SMTP config. "
+        f"Draft is in 'send_failed' state and can be retried from Pending Approvals.",
+    )
     return False
 
 
 def approve_and_send(draft_id: int, force_immediate: bool = False) -> bool:
     """
-    Approve a draft and send or schedule it.
+    Approve a draft and send it immediately or schedule it.
 
-    FIX P2b (template subject):
-    Looks up the template for the email's query_type and passes its subject
-    field to _do_send() so the delivered email uses the admin-configured
-    subject rather than always defaulting to "Re: <original subject>".
+    FIX P2 (DB error returns False, not True):
+    update_draft_if_status() returns _DB_ERROR on a real exception.  We now
+    check for that sentinel explicitly and return False so the API endpoint
+    raises HTTP 500 instead of silently returning success.
 
-    FIX P1 (atomic claim — replaces optimistic status check):
-    Uses update_draft_if_status() to atomically flip status to 'sending'.
-    Only one concurrent caller wins the row; the loser returns True immediately.
+    FIX P1 (int() on delay_secs can raise inside critical section):
+    delay_secs comes from a live DB setting.  If it contains a non-numeric
+    value, bare int() would raise after the draft has been claimed as
+    'sending', permanently hiding it.  _safe_int() is used instead.
 
-    FIX P1 (scheduled_send_at cleared on immediate retry):
-    The immediate send path passes scheduled_send_at=None to clear any stale
-    timestamp from a previous scheduled approval.
-
-    Returns True on success (sent or scheduled), False on hard failure.
+    Earlier fixes (preserved):
+    - Template subject passed to _do_send().
+    - Atomic claim via update_draft_if_status().
+    - scheduled_send_at cleared on immediate path.
     """
     now = datetime.now(timezone.utc).isoformat()
 
@@ -268,18 +282,29 @@ def approve_and_send(draft_id: int, force_immediate: bool = False) -> bool:
         status="sending",
         approved_at=now,
     )
+
+    # FIX P2: _DB_ERROR means the DB call itself failed — surface as hard error.
+    if isinstance(claimed, _DbErrorType):
+        logger.error(
+            f"approve_and_send: DB error while claiming draft {draft_id}. "
+            f"Draft was NOT updated. Returning failure so the UI shows an error."
+        )
+        return False
+
     if claimed is None:
+        # Status mismatch: another worker already claimed or the draft is in a
+        # terminal state.  This is idempotent — treat as success.
         draft = get_draft_by_id(draft_id)
         if not draft:
             logger.error(f"approve_and_send: draft {draft_id} not found in DB")
             return False
-        current = draft.get("status")
         logger.warning(
-            f"approve_and_send: draft {draft_id} has status '{current}' "
+            f"approve_and_send: draft {draft_id} has status '{draft.get('status')}' "
             f"— skipping (already claimed or terminal state)."
         )
         return True
 
+    # We own the claim.  Load full records.
     draft = get_draft_by_id(draft_id)
     if not draft:
         logger.error(f"approve_and_send: draft {draft_id} vanished after claim")
@@ -293,50 +318,46 @@ def approve_and_send(draft_id: int, force_immediate: bool = False) -> bool:
 
     query_type = record.get("query_type") or "general"
     tmpl       = get_template_by_query_type(query_type)
-    delay_secs = tmpl.get("send_delay_seconds") if tmpl else None
 
-    # FIX P2b: resolve the subject to use for delivery.
-    # Template subject takes priority; fall back to "Re: <original>" otherwise.
+    # FIX P1: use _safe_int() — delay_secs comes from a live DB value.
+    raw_delay  = (tmpl.get("send_delay_seconds") if tmpl else None)
+    delay_secs = _safe_int(str(raw_delay), 0, "send_delay_seconds") if raw_delay is not None else 0
+
     tmpl_subject: str | None = (tmpl.get("subject") or "").strip() if tmpl else None
 
     # ── Scheduled path ────────────────────────────────────────────────────────
-    if not force_immediate and delay_secs and int(delay_secs) > 0:
+    if not force_immediate and delay_secs > 0:
         send_at = (
-            datetime.now(timezone.utc) + timedelta(seconds=int(delay_secs))
+            datetime.now(timezone.utc) + timedelta(seconds=delay_secs)
         ).isoformat()
         update_draft(draft_id, status="approved", scheduled_send_at=send_at)
         update_email_status(record["id"], "approved")
         insert_log(
             record["id"], "email_scheduled",
-            f"Draft {draft_id} scheduled for {send_at} ({delay_secs}s delay)."
+            f"Draft {draft_id} scheduled for {send_at} ({delay_secs}s delay).",
         )
         logger.info(f"Draft {draft_id} scheduled to send at {send_at}")
         return True
 
     # ── Immediate path ────────────────────────────────────────────────────────
-    if force_immediate and delay_secs and int(delay_secs) > 0:
+    if force_immediate and delay_secs > 0:
         logger.info(f"Draft {draft_id} — timer overridden, sending immediately.")
-        insert_log(record["id"], "timer_overridden",
-                   f"Draft {draft_id} sent immediately despite {delay_secs}s timer.")
+        insert_log(
+            record["id"], "timer_overridden",
+            f"Draft {draft_id} sent immediately despite {delay_secs}s timer.",
+        )
 
-    # FIX P1: clear any stale scheduled_send_at so the scheduler cannot
-    # double-claim this draft after an immediate send.
+    # Clear any stale scheduled_send_at so the scheduler cannot double-claim.
     update_draft(draft_id, scheduled_send_at=None)
     update_email_status(record["id"], "approved")
 
-    # FIX P2b: pass template subject to _do_send().
     return _do_send(draft_id, draft, record, override_subject=tmpl_subject)
 
 
-def dispatch_scheduled_drafts():
+def dispatch_scheduled_drafts() -> None:
     """
-    Called periodically by the scheduler.
-
-    Uses get_and_claim_scheduled_drafts() which atomically sets status to
-    'sending' in the same DB query that selects due drafts, preventing
-    double-send under concurrent workers.
-
-    FIX P2b: passes the template subject to _do_send() for each due draft.
+    Called periodically by the scheduler.  Atomically claims and sends any
+    approved drafts whose scheduled_send_at has passed.
     """
     due = get_and_claim_scheduled_drafts()
     if not due:
@@ -352,10 +373,9 @@ def dispatch_scheduled_drafts():
             update_draft(draft["id"], status="approved")
             continue
 
-        # FIX P2b: resolve template subject for scheduled sends too.
-        query_type = record.get("query_type") or "general"
-        tmpl = get_template_by_query_type(query_type)
-        tmpl_subject: str | None = (tmpl.get("subject") or "").strip() if tmpl else None
+        query_type   = record.get("query_type") or "general"
+        tmpl         = get_template_by_query_type(query_type)
+        tmpl_subject = (tmpl.get("subject") or "").strip() if tmpl else None
 
         _do_send(draft["id"], draft, record, override_subject=tmpl_subject)
 
