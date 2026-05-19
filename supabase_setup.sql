@@ -386,6 +386,31 @@ CREATE POLICY admin_only ON public.custom_query_types
     USING      (coalesce((auth.jwt() -> 'app_metadata' ->> 'role') = 'admin', false))
     WITH CHECK (coalesce((auth.jwt() -> 'app_metadata' ->> 'role') = 'admin', false));
 
+WITH duplicates AS (
+    SELECT id
+    FROM (
+        SELECT
+            id,
+            query_type,
+            ROW_NUMBER() OVER (
+                PARTITION BY query_type
+                ORDER BY id ASC          -- keep the oldest row (lowest id)
+            ) AS rn
+        FROM templates
+        WHERE query_type IS NOT NULL     -- NULL query_type rows are ignored
+    ) ranked
+    WHERE rn > 1                         -- surplus rows: all but the first
+)
+DELETE FROM templates
+WHERE id IN (SELECT id FROM duplicates);
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_templates_query_type_unique
+    ON templates (query_type)
+    WHERE query_type IS NOT NULL;
+
+
+
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- Done.
