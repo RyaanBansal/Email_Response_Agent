@@ -3,25 +3,48 @@ app/db/models.py  –  Supabase table helpers
 
 Fixes applied (this revision)
 ──────────────────────────────
-P1 (Stranded emails after ingestion errors):
-  Added get_pending_emails_without_draft() — returns 'pending' emails that have
-  no associated draft_responses row.  Used by run_pipeline() to recover emails
-  whose draft-generation step failed in a previous run so they are retried
-  automatically rather than silently abandoned.
+P1 (Stale 'sending' drafts permanently hidden):
+  Added recover_stale_sending_drafts().  Any draft stuck in 'sending' for
+  longer than SENDING_TIMEOUT_MINUTES (default 10) is reset to 'send_failed'
+  and its parent email back to 'approved', making both visible in Pending
+  Approvals for admin retry.
+
+  The stale-detection timestamp uses the draft's generated_at column rather
+  than approved_at.  approved_at is only set on the manual-approval path;
+  drafts claimed by the scheduled-dispatch path (get_and_claim_scheduled_drafts)
+  transition directly to 'sending' without touching approved_at, so using
+  approved_at would miss those rows entirely.  generated_at is always present
+  and provides a safe, conservative upper bound on how long any draft should
+  ever spend in 'sending'.
+
+P2 (update_draft_if_status hides DB errors):
+  Returns the module-level _DB_ERROR sentinel on exception instead of None,
+  so callers can distinguish "another worker claimed it first" (None → benign
+  skip) from "the DB call itself failed" (_DB_ERROR → hard failure that must
+  be surfaced to the admin).
+
+P2 (nondeterministic template selection):
+  get_template_by_query_type() now orders by id ASC so the oldest
+  (first-created) template wins when duplicates exist, giving deterministic
+  behaviour at runtime.  A UNIQUE index on templates(query_type) is added via
+  migration (see supabase_migration_unique_query_type.sql) to prevent new
+  duplicates at the DB level.
 
 Earlier fixes (preserved)
 ──────────────────────────
 P1 (approve_and_send race condition):
-  Added update_draft_if_status() — an atomic conditional UPDATE that flips a
-  draft's status only when it currently matches an expected set of values.
+  update_draft_if_status() — atomic conditional UPDATE.
 
 P1 (send_failed invisible):
-  get_pending_drafts() returns both 'pending' and 'send_failed' drafts.
+  get_pending_drafts() returns 'pending' and 'send_failed'.
+
+P1 (stranded emails):
+  get_pending_emails_without_draft().
 
 P2 (double-send):
-  get_and_claim_scheduled_drafts() uses atomic update-then-select pattern.
+  get_and_claim_scheduled_drafts() atomic update-then-select.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from loguru import logger
 from app.db.database import get_supabase_admin_client
 
@@ -32,6 +55,30 @@ def _db():
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Sentinel returned by update_draft_if_status() on a real DB error.
+# Distinct from None, which means "status mismatch / row not found".
+# Using a dedicated class (not a string or bool) makes isinstance checks
+# unambiguous and avoids accidental equality with normal return values.
+# ---------------------------------------------------------------------------
+class _DbErrorType:
+    """Singleton sentinel — one instance, _DB_ERROR, used as a return value."""
+    _instance = None
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    def __repr__(self):
+        return "_DB_ERROR"
+
+_DB_ERROR = _DbErrorType()
+
+# How long a draft may remain in 'sending' before being considered stale.
+# Must be comfortably longer than any realistic SMTP timeout (20 s in sender.py)
+# but short enough to surface crashes promptly.  10 minutes is conservative.
+SENDING_TIMEOUT_MINUTES = 10
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -116,21 +163,12 @@ def get_pending_emails_without_draft() -> list[dict]:
     """
     Return 'pending' emails that have no associated draft_responses row.
 
-    FIX P1b (stranded emails):
-    These are emails that were inserted by poll_inbox() but whose downstream
-    processing (classification, draft generation, DB insert) failed before a
-    draft record could be created.  run_pipeline() calls this each run so that
-    stranded emails are automatically retried rather than silently abandoned.
-
-    Implementation note: Supabase PostgREST does not expose a native anti-join
-    directly, so we fetch pending email IDs and the set of email IDs that have
-    at least one draft, then compute the difference in Python.  For typical
-    support-inbox volumes (hundreds to low-thousands of rows) this is
-    perfectly efficient.  If the table grows to tens of thousands of pending
-    rows, replace this with a DB-side NOT EXISTS subquery via an RPC function.
+    FIX P1b (stranded emails — earlier fix, preserved):
+    These are emails inserted by poll_inbox() whose downstream processing
+    failed before a draft record was created.  run_pipeline() calls this each
+    run so they are retried automatically rather than silently abandoned.
     """
     try:
-        # All pending email IDs.
         pending_res = (
             _db().table("emails")
             .select("*")
@@ -144,7 +182,6 @@ def get_pending_emails_without_draft() -> list[dict]:
 
         pending_ids = [r["id"] for r in pending_rows]
 
-        # Email IDs that already have at least one draft (any status).
         drafted_res = (
             _db().table("draft_responses")
             .select("email_id")
@@ -153,7 +190,6 @@ def get_pending_emails_without_draft() -> list[dict]:
         )
         drafted_ids: set[int] = {r["email_id"] for r in (drafted_res.data or [])}
 
-        # Return only emails with no draft record.
         return [r for r in pending_rows if r["id"] not in drafted_ids]
 
     except Exception as exc:
@@ -180,9 +216,8 @@ def get_pending_drafts() -> list[dict]:
     """
     Return drafts that need admin attention: pending approvals AND failed sends.
 
-    FIX P1: Previously only 'pending' was returned, so 'send_failed' drafts
-    disappeared from the UI after an SMTP failure.  Admins can now see and
-    retry them from the Pending Approvals page.
+    FIX P1 (earlier fix, preserved):
+    'send_failed' drafts were previously invisible after an SMTP failure.
     """
     res = (
         _db().table("draft_responses")
@@ -215,31 +250,26 @@ def update_draft_if_status(
     draft_id: int,
     from_statuses: tuple[str, ...],
     **fields,
-) -> dict | None:
+) -> dict | None | _DbErrorType:
     """
-    Atomic conditional update: set `fields` on draft `draft_id` only when its
-    current status is one of `from_statuses`.  Returns the updated row dict if
-    the condition matched, or None if the row was not updated (status mismatch,
-    or the row does not exist).
+    Atomic conditional update: apply `fields` to draft `draft_id` only when
+    its current status is one of `from_statuses`.
 
-    This is the building block for race-free draft claiming.  The Supabase
-    Python client issues a single PATCH with Prefer: return=representation,
-    which is effectively:
+    Return values
+    ─────────────
+    dict          — The updated row.  This caller won the atomic claim.
+    None          — Status mismatch or row not found.  Another worker already
+                    claimed the draft, or it reached a terminal state.  The
+                    caller should treat this as a benign idempotent skip.
+    _DB_ERROR     — A real DB / network exception occurred.  The draft was NOT
+                    updated.  The caller must treat this as a hard failure and
+                    surface it to the admin (return False / HTTP 500).
 
-        UPDATE draft_responses
-        SET    <fields>
-        WHERE  id = draft_id
-          AND  status = ANY(from_statuses)
-        RETURNING *;
-
-    Only the first concurrent caller whose UPDATE touches the row gets it
-    back; every subsequent caller finds the status has already changed and
-    receives an empty result.
-
-    NOTE: For true serialisable safety across multiple DB replicas or under
-    high concurrency, replace this with a PL/pgSQL function that uses
-    SELECT ... FOR UPDATE SKIP LOCKED.  For the typical single-node Supabase
-    deployment this implementation is sufficient.
+    FIX P2 (this revision):
+    Previously returned None for both "status mismatch" and actual exceptions,
+    so approve_and_send() silently skipped drafts on transient DB failures
+    while showing "Approved" in the UI.  _DB_ERROR lets callers distinguish
+    the two cases.
     """
     try:
         res = (
@@ -252,7 +282,7 @@ def update_draft_if_status(
         return res.data[0] if res.data else None
     except Exception as exc:
         logger.error(f"update_draft_if_status({draft_id}) error: {exc}")
-        return None
+        return _DB_ERROR
 
 
 def count_drafts_by_status(status: str) -> int:
@@ -271,6 +301,87 @@ def get_sent_drafts_with_times() -> list[dict]:
     return res.data or []
 
 
+def recover_stale_sending_drafts() -> int:
+    """
+    Reset drafts stuck in 'sending' for longer than SENDING_TIMEOUT_MINUTES
+    back to 'send_failed', and roll the parent email back to 'approved'.
+
+    FIX P1 (stale 'sending' drafts permanently hidden):
+    'sending' is a transient claim set just before SMTP delivery.  If the
+    process crashes, is OOM-killed, or raises an unhandled exception after the
+    claim but before the status is updated to 'sent' or 'send_failed', the
+    draft stays in 'sending' forever.  Pending Approvals only surfaces
+    'pending' and 'send_failed', so stale 'sending' drafts are permanently
+    invisible.
+
+    Timestamp choice — generated_at, not approved_at:
+    approved_at is only set on the manual-approval path (approve_and_send).
+    Drafts claimed by get_and_claim_scheduled_drafts() go directly from
+    'approved' to 'sending' without updating approved_at, leaving it NULL.
+    A filter on approved_at would therefore miss all scheduled drafts that
+    get stuck.  generated_at is always populated at insert time and provides
+    a safe conservative bound: any draft still in 'sending' more than
+    SENDING_TIMEOUT_MINUTES after it was first created is unambiguously stale.
+
+    Called at the top of every run_pipeline() pass so the recovery window is
+    bounded by poll_interval + SENDING_TIMEOUT_MINUTES.
+
+    Returns the number of drafts successfully reset.
+    """
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=SENDING_TIMEOUT_MINUTES)
+    ).isoformat()
+
+    try:
+        res = (
+            _db().table("draft_responses")
+            .select("id, email_id, generated_at")
+            .eq("status", "sending")
+            .lte("generated_at", cutoff)   # generated_at is always set; never NULL
+            .execute()
+        )
+        stale: list[dict] = res.data or []
+    except Exception as exc:
+        logger.error(f"recover_stale_sending_drafts: query failed: {exc}")
+        return 0
+
+    if not stale:
+        return 0
+
+    logger.warning(
+        f"recover_stale_sending_drafts: {len(stale)} stale draft(s) in 'sending' "
+        f"(older than {SENDING_TIMEOUT_MINUTES} min): {[d['id'] for d in stale]}"
+    )
+
+    recovered = 0
+    for draft in stale:
+        try:
+            update_draft(draft["id"], status="send_failed")
+            update_email_status(draft["email_id"], "approved")
+            insert_log(
+                draft["email_id"],
+                "send_stale_recovered",
+                f"Draft {draft['id']} was stuck in 'sending' since "
+                f"{draft.get('generated_at', 'unknown')}; reset to 'send_failed' "
+                f"for admin retry.",
+            )
+            recovered += 1
+            logger.info(
+                f"recover_stale_sending_drafts: reset draft {draft['id']} "
+                f"(email {draft['email_id']}) to 'send_failed'."
+            )
+        except Exception as exc:
+            logger.error(
+                f"recover_stale_sending_drafts: failed to reset draft "
+                f"{draft['id']}: {exc}"
+            )
+
+    logger.info(
+        f"recover_stale_sending_drafts: reset {recovered}/{len(stale)} draft(s)."
+    )
+    return recovered
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # templates table
 # ══════════════════════════════════════════════════════════════════════════════
@@ -281,10 +392,20 @@ def get_all_templates() -> list[dict]:
 
 
 def get_template_by_query_type(query_type: str) -> dict | None:
+    """
+    Return the template for query_type.
+
+    FIX P2 (nondeterministic selection):
+    Previously used limit(1) with no ordering, so when multiple templates
+    share the same query_type the returned row was arbitrary.  Now orders by
+    id ASC so the oldest (first-created) template always wins, giving
+    deterministic behaviour until the UNIQUE constraint migration is applied.
+    """
     res = (
         _db().table("templates")
         .select("*")
         .eq("query_type", query_type)
+        .order("id", desc=False)    # oldest row wins; deterministic with duplicates
         .limit(1)
         .execute()
     )
@@ -387,13 +508,11 @@ def update_template_timer(template_id: int, send_delay_seconds: int | None) -> N
 def get_and_claim_scheduled_drafts() -> list[dict]:
     """
     Atomically claim and return approved drafts whose scheduled_send_at has
-    passed by flipping their status to 'sending' in the same operation.
+    passed by flipping their status to 'sending' in the same DB operation.
 
-    FIX P2 (double-send prevention):
-    The update() call sets status='sending' on all qualifying rows before
-    returning them.  A second scheduler worker or tick will not find these
-    rows because their status is no longer 'approved', so they cannot be
-    dispatched twice.
+    FIX P2 (double-send prevention — earlier fix, preserved):
+    A second scheduler tick or worker finds status='sending' and skips the
+    row, preventing duplicate delivery.
     """
     now = datetime.now(timezone.utc).isoformat()
     try:
