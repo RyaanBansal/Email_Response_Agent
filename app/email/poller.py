@@ -4,6 +4,15 @@ app/email/poller.py  –  IMAP inbox poller
 Settings (IMAP_HOST, IMAP_PORT, EMAIL_ADDRESS, EMAIL_PASSWORD, MAX_REPEAT_COUNT)
 are resolved live from app_settings DB table with .env fallback so they can be
 updated from the Settings UI without restarting the app.
+
+Fix applied (this revision)
+────────────────────────────
+P1 (int() on live settings can raise in the poll path):
+  IMAP_PORT and MAX_REPEAT_COUNT were parsed with bare int().  A non-numeric
+  value in app_settings (e.g. "993x") raises ValueError and aborts poll_inbox()
+  before any emails are processed.  _safe_int() is used instead: it falls back
+  to the supplied default and logs a warning so the misconfiguration is
+  immediately visible without crashing the pipeline.
 """
 import email
 import os
@@ -29,6 +38,23 @@ def _cfg(key: str, default: str = "") -> str:
     except Exception:
         pass
     return os.getenv(key, default)
+
+
+def _safe_int(value: str, default: int, label: str) -> int:
+    """
+    Parse value as int, returning default on failure.
+
+    FIX P1: Replaces bare int() on live-settings strings so a bad stored
+    value never raises ValueError inside poll_inbox().
+    """
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        logger.warning(
+            f"poll_inbox: {label}={value!r} is not a valid integer; "
+            f"using default {default}."
+        )
+        return default
 
 
 def _decode_str(value, charset="utf-8") -> str:
@@ -63,10 +89,10 @@ def _parse_sender(raw_from: str) -> str:
 
 def poll_inbox() -> list[dict]:
     imap_host  = _cfg("IMAP_HOST", "imap.gmail.com")
-    imap_port  = int(_cfg("IMAP_PORT", "993"))
+    imap_port  = _safe_int(_cfg("IMAP_PORT", "993"), 993, "IMAP_PORT")    # FIX P1
     email_addr = _cfg("EMAIL_ADDRESS")
     email_pass = _cfg("EMAIL_PASSWORD")
-    max_repeat = int(_cfg("MAX_REPEAT_COUNT", "3"))
+    max_repeat = _safe_int(_cfg("MAX_REPEAT_COUNT", "3"), 3, "MAX_REPEAT_COUNT")  # FIX P1
 
     if not email_addr or not email_pass:
         logger.warning("IMAP credentials not set. Skipping poll.")
