@@ -1,18 +1,26 @@
 """
 app/email/sender.py  –  SMTP outbound email sender
 
-Security / reliability fixes applied
-──────────────────────────────────────
-P1 (Missing credentials treated as success):
-  send_email() previously returned True in dry-run mode, which caused the
-  orchestrator to mark emails as 'sent' even when no email was dispatched.
-  It now returns False when credentials are absent, so the draft is left in
-  'send_failed' status and remains visible in the UI for retry.
+Fix applied (this revision)
+────────────────────────────
+P1 (int() on live settings can raise mid-send, leaving draft stuck in 'sending'):
+  SMTP_PORT and IMAP_PORT were parsed with bare int().  If a non-numeric value
+  is stored in app_settings, ValueError is raised after send_email() is called
+  but before _do_send() in orchestrator.py has a chance to set the draft to
+  'send_failed'.  Because the draft was already claimed as 'sending' by the
+  atomic update in approve_and_send(), it would be permanently hidden from
+  Pending Approvals.
 
-P3/P1 (send_failed status):
-  Works in conjunction with orchestrator.py fix — _do_send() now sets
-  draft status to 'send_failed' on failure so the admin can see and retry
-  the item, rather than it silently disappearing from all queues.
+  _safe_int() is used instead: it falls back to the supplied default and logs
+  a warning, allowing the send attempt to proceed (or fail cleanly with the
+  normal SMTP error path) rather than raising unexpectedly.
+
+Earlier fixes (preserved)
+──────────────────────────
+P1 (Missing credentials treated as success):
+  send_email() returns False when EMAIL_ADDRESS / EMAIL_PASSWORD are absent
+  rather than True, so the orchestrator correctly marks the draft 'send_failed'
+  instead of 'sent'.
 """
 import os
 import ssl
@@ -38,6 +46,24 @@ def _cfg(key: str, default: str = "") -> str:
     except Exception:
         pass
     return os.getenv(key, default)
+
+
+def _safe_int(value: str, default: int, label: str) -> int:
+    """
+    Parse value as int, returning default on failure.
+
+    FIX P1: Replaces bare int() calls on live-settings strings.  A bad stored
+    value (e.g. "587x") now falls back to default and logs a warning instead of
+    raising ValueError mid-send, which would leave the draft stuck in 'sending'.
+    """
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        logger.warning(
+            f"send_email: {label}={value!r} is not a valid integer; "
+            f"using default {default}."
+        )
+        return default
 
 
 def _use_ssl(smtp_port: int, smtp_mode: str) -> bool:
@@ -97,25 +123,24 @@ def send_email(to: str, subject: str, body: str) -> bool:
     credentials (previously this returned True, silently losing emails).
     """
     smtp_host     = _cfg("SMTP_HOST", "smtp.gmail.com")
-    smtp_port     = int(_cfg("SMTP_PORT", "587"))
+    smtp_port     = _safe_int(_cfg("SMTP_PORT", "587"), 587, "SMTP_PORT")   # FIX P1
     smtp_mode     = _cfg("SMTP_MODE", "").lower()
     imap_host     = _cfg("IMAP_HOST", "imap.gmail.com")
-    imap_port     = int(_cfg("IMAP_PORT", "993"))
+    imap_port     = _safe_int(_cfg("IMAP_PORT", "993"), 993, "IMAP_PORT")   # FIX P1
     email_addr    = _cfg("EMAIL_ADDRESS")
     email_pass    = _cfg("EMAIL_PASSWORD")
     sent_override = _cfg("IMAP_SENT_FOLDER", "")
 
-    # ── FIX P1: missing credentials are a hard failure, not a silent no-op ──
     if not email_addr or not email_pass:
         logger.error(
             "SMTP credentials (EMAIL_ADDRESS / EMAIL_PASSWORD) are not configured. "
             "Email NOT sent. Set credentials in Settings or .env and retry."
         )
-        return False   # was True — caused DB records to be falsely marked 'sent'
+        return False
 
-    msg       = _build_message(email_addr, to, subject, body)
-    raw_bytes = msg.as_bytes()
-    use_ssl   = _use_ssl(smtp_port, smtp_mode)
+    msg        = _build_message(email_addr, to, subject, body)
+    raw_bytes  = msg.as_bytes()
+    use_ssl    = _use_ssl(smtp_port, smtp_mode)
     mode_label = "SSL" if use_ssl else "STARTTLS"
     logger.info(f"Connecting to {smtp_host}:{smtp_port} via {mode_label}")
 
