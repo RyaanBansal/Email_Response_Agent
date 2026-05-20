@@ -72,13 +72,31 @@ async def lifespan(app: FastAPI):
         from app.db.models import get_setting
 
         def _poll_interval() -> int:
+            # Safe parsing: a bad stored value (e.g. "60x") must not raise
+            # ValueError here and crash the lifespan context at startup.
+            # The same fix was applied in poller.py, sender.py, and
+            # orchestrator.py; this completes the set.
             try:
                 val = get_setting("POLL_INTERVAL_SECONDS")
                 if val:
-                    return int(val)
+                    try:
+                        return int(val)
+                    except (ValueError, TypeError):
+                        logger.warning(
+                            f"POLL_INTERVAL_SECONDS={val!r} in app_settings is not "
+                            f"a valid integer; falling back to env/default."
+                        )
             except Exception:
                 pass
-            return int(os.getenv("POLL_INTERVAL_SECONDS", 60))
+            raw = os.getenv("POLL_INTERVAL_SECONDS", "60")
+            try:
+                return int(raw)
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"POLL_INTERVAL_SECONDS={raw!r} env var is not a valid integer; "
+                    f"defaulting to 60s."
+                )
+                return 60
 
         interval = _poll_interval()
         _scheduler = BackgroundScheduler()
