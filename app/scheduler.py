@@ -14,15 +14,30 @@ load_dotenv()
 
 
 def _get_poll_interval() -> int:
-    """Read poll interval from app_settings (live) or fall back to env."""
+    """Read poll interval from app_settings (live) or fall back to env.
+    Uses safe int parsing so a bad stored value never raises ValueError."""
     try:
         from app.db.models import get_setting
         val = get_setting("POLL_INTERVAL_SECONDS")
         if val:
-            return int(val)
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"POLL_INTERVAL_SECONDS={val!r} in app_settings is not "
+                    f"a valid integer; falling back to env/default."
+                )
     except Exception:
         pass
-    return int(os.getenv("POLL_INTERVAL_SECONDS", 60))
+    raw = os.getenv("POLL_INTERVAL_SECONDS", "60")
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        logger.warning(
+            f"POLL_INTERVAL_SECONDS={raw!r} env var is not a valid integer; "
+            f"defaulting to 60s."
+        )
+        return 60
 
 
 def start_scheduler():
