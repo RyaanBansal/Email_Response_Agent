@@ -3,11 +3,12 @@ app/orchestrator.py  –  Main pipeline orchestrator (Supabase version)
 
 Fixes applied (this revision)
 ──────────────────────────────
-P1 (Stale 'sending' drafts permanently hidden):
-  run_pipeline() calls recover_stale_sending_drafts() at the start of every
-  pass.  Any draft stuck in 'sending' for longer than SENDING_TIMEOUT_MINUTES
-  (10 min) is reset to 'send_failed' with the parent email back to 'approved',
-  making both visible in Pending Approvals for admin retry.
+P1 (Stale-send recovery could mark an actively-sending draft as failed):
+  approve_and_send() now stamps sending_started_at=now in its atomic claim.
+  This pairs with the same stamp in get_and_claim_scheduled_drafts() so
+  recover_stale_sending_drafts() measures the timeout from the real claim
+  time rather than generated_at, preventing a freshly-claimed draft from
+  being falsely recovered while SMTP is still running.
 
 P1 (int() on live settings can raise inside critical sections):
   _get_max_repeat_count() and approve_and_send() used bare int() on values
@@ -281,6 +282,12 @@ def approve_and_send(draft_id: int, force_immediate: bool = False) -> bool:
         from_statuses=("pending", "send_failed"),
         status="sending",
         approved_at=now,
+        # FIX P1 (stale-send recovery): record the exact moment this draft
+        # entered 'sending' so recover_stale_sending_drafts() measures the
+        # timeout from here, not from generated_at.  A draft approved minutes
+        # after it was generated would otherwise be immediately eligible for
+        # false recovery while SMTP is still in flight.
+        sending_started_at=now,
     )
 
     # FIX P2: _DB_ERROR means the DB call itself failed — surface as hard error.
