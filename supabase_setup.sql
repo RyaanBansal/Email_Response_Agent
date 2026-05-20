@@ -59,34 +59,42 @@ CREATE TABLE IF NOT EXISTS emails (
 
 -- ── 1b. draft_responses ───────────────────────────────────────────────────────
 -- Stores AI-generated (and optionally admin-edited) draft replies.
--- draft_body       = original AI output
--- edited_body      = admin-edited version; used in place of draft_body if set
--- confidence       = AI classification confidence (0.0–1.0)
+-- draft_body        = original AI output
+-- edited_body       = admin-edited version; used in place of draft_body if set
+-- confidence        = AI classification confidence (0.0–1.0)
 -- scheduled_send_at = populated when a template send_delay_seconds is set;
---                    NULL means send immediately on approval
--- status           = pipeline state for this draft
+--                     NULL means send immediately on approval
+-- sending_started_at = stamped by both claim paths (approve_and_send and
+--                     get_and_claim_scheduled_drafts) at the moment status
+--                     transitions to 'sending'.  Used by
+--                     recover_stale_sending_drafts() to measure how long a
+--                     draft has been in-flight, so a draft created long before
+--                     it was claimed is never falsely flagged as stale while
+--                     SMTP is still running.
+-- status            = pipeline state for this draft
 
 CREATE TABLE IF NOT EXISTS draft_responses (
-    id                SERIAL PRIMARY KEY,
-    email_id          INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
-    draft_body        TEXT,
-    edited_body       TEXT,
-    confidence        FLOAT DEFAULT 0.0,
-    generated_at      TIMESTAMPTZ DEFAULT NOW(),
-    approved_at       TIMESTAMPTZ,
-    rejected_at       TIMESTAMPTZ,
-    sent_at           TIMESTAMPTZ,
-    scheduled_send_at TIMESTAMPTZ DEFAULT NULL,
-    status            VARCHAR(32) DEFAULT 'pending'
-                      CHECK (status IN (
-                          'pending',
-                          'approved',
-                          'rejected',
-                          'sent',
-                          'send_failed',
-                          'sending'
-                      )),
-    admin_note        TEXT
+    id                  SERIAL PRIMARY KEY,
+    email_id            INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+    draft_body          TEXT,
+    edited_body         TEXT,
+    confidence          FLOAT DEFAULT 0.0,
+    generated_at        TIMESTAMPTZ DEFAULT NOW(),
+    approved_at         TIMESTAMPTZ,
+    rejected_at         TIMESTAMPTZ,
+    sent_at             TIMESTAMPTZ,
+    scheduled_send_at   TIMESTAMPTZ DEFAULT NULL,
+    sending_started_at  TIMESTAMPTZ DEFAULT NULL,
+    status              VARCHAR(32) DEFAULT 'pending'
+                        CHECK (status IN (
+                            'pending',
+                            'approved',
+                            'rejected',
+                            'sent',
+                            'send_failed',
+                            'sending'
+                        )),
+    admin_note          TEXT
 );
 
 COMMENT ON COLUMN draft_responses.status IS
@@ -99,6 +107,10 @@ COMMENT ON COLUMN draft_responses.status IS
 
 COMMENT ON COLUMN draft_responses.scheduled_send_at IS
     'UTC timestamp when the draft should be sent. NULL = send immediately.';
+
+COMMENT ON COLUMN draft_responses.sending_started_at IS
+    'Stamped when status transitions to ''sending''. Used by stale-send recovery '
+    'to measure elapsed in-flight time rather than time since draft creation.';
 
 
 -- ── 1c. templates ─────────────────────────────────────────────────────────────
@@ -185,12 +197,42 @@ CREATE INDEX IF NOT EXISTS idx_drafts_scheduled
     ON draft_responses (status, scheduled_send_at)
     WHERE status = 'approved' AND scheduled_send_at IS NOT NULL;
 
+-- Speeds up recover_stale_sending_drafts() which scans all 'sending' rows
+-- and checks sending_started_at to determine staleness.
+CREATE INDEX IF NOT EXISTS idx_drafts_sending_started_at
+    ON draft_responses (sending_started_at)
+    WHERE status = 'sending';
+
 -- activity_logs
 CREATE INDEX IF NOT EXISTS idx_logs_created_at ON activity_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_email_id   ON activity_logs(email_id);
 
 -- custom_query_types
 CREATE INDEX IF NOT EXISTS idx_custom_query_types_name ON custom_query_types(name);
+
+-- Enforce one template per query_type (dedup before creating the index).
+-- Keeps the oldest row (lowest id) when duplicates exist.
+WITH duplicates AS (
+    SELECT id
+    FROM (
+        SELECT
+            id,
+            query_type,
+            ROW_NUMBER() OVER (
+                PARTITION BY query_type
+                ORDER BY id ASC          -- keep the oldest row (lowest id)
+            ) AS rn
+        FROM templates
+        WHERE query_type IS NOT NULL     -- NULL query_type rows are ignored
+    ) ranked
+    WHERE rn > 1                         -- surplus rows: all but the first
+)
+DELETE FROM templates
+WHERE id IN (SELECT id FROM duplicates);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_templates_query_type_unique
+    ON templates (query_type)
+    WHERE query_type IS NOT NULL;
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -385,31 +427,6 @@ CREATE POLICY admin_only ON public.custom_query_types
     FOR ALL TO authenticated
     USING      (coalesce((auth.jwt() -> 'app_metadata' ->> 'role') = 'admin', false))
     WITH CHECK (coalesce((auth.jwt() -> 'app_metadata' ->> 'role') = 'admin', false));
-
-WITH duplicates AS (
-    SELECT id
-    FROM (
-        SELECT
-            id,
-            query_type,
-            ROW_NUMBER() OVER (
-                PARTITION BY query_type
-                ORDER BY id ASC          -- keep the oldest row (lowest id)
-            ) AS rn
-        FROM templates
-        WHERE query_type IS NOT NULL     -- NULL query_type rows are ignored
-    ) ranked
-    WHERE rn > 1                         -- surplus rows: all but the first
-)
-DELETE FROM templates
-WHERE id IN (SELECT id FROM duplicates);
-
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_templates_query_type_unique
-    ON templates (query_type)
-    WHERE query_type IS NOT NULL;
-
-
 
 
 -- ═══════════════════════════════════════════════════════════════════════════════
