@@ -107,9 +107,18 @@ def approve(draft_id: int, body: SaveBody, _user=Depends(get_current_user)):
     from concurrent requests; no additional pre-check is needed here.
     If force_immediate=True, bypass the template timer and send right away.
     """
+    # If the admin supplied an edited body, pass it to approve_and_send via
+    # save_edited_draft first — but only when the draft is still mutable.
+    # _assert_mutable raises 409 for terminal states (sent, rejected, approved).
+    #
+    # Race note: a concurrent approve or the scheduler could claim the draft
+    # between _assert_mutable and the approve_and_send() call below.  If that
+    # happens, approve_and_send() returns True via its idempotent-skip path.
+    # The edit written here is harmless: _do_send() re-fetches the draft just
+    # before calling send_email(), so the winning claimer picks up the edit.
+    # The window is narrow (two DB calls apart) and the worst case is the edit
+    # being redundantly written to a row already in 'sending' — no data loss.
     if body.body:
-        # Save the edit only if the draft is still in a mutable state.
-        # _assert_mutable raises 409 if it has already been claimed/sent.
         _assert_mutable(draft_id)
         save_edited_draft(draft_id, body.body)
     success = approve_and_send(draft_id, force_immediate=body.force_immediate)
