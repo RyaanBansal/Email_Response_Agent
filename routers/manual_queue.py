@@ -169,9 +169,14 @@ def submit_manual_reply(email_id: int, payload: ManualReplyBody, _user=Depends(g
     subject  = f"Re: {record.get('subject') or 'Your Inquiry'}"
     now      = datetime.now(timezone.utc).isoformat()
 
-    # Mark approved before sending so the draft is claimed and won't be
-    # picked up by the scheduled dispatcher.
-    update_draft(draft_id, status="approved", approved_at=now)
+    # Claim the draft as 'sending' (not 'approved') so that:
+    #   1. The scheduled dispatcher cannot pick it up.
+    #   2. recover_stale_sending_drafts() can rescue it if the process crashes
+    #      between this point and the success/failure status update below.
+    # sending_started_at is stamped for the same reason it is in approve_and_send
+    # and get_and_claim_scheduled_drafts — so stale-send recovery measures from
+    # the real claim time, not from generated_at.
+    update_draft(draft_id, status="sending", approved_at=now, sending_started_at=now)
     update_email_status(email_id, "approved")
 
     sent = send_email(to=record["sender"], subject=subject, body=payload.body.strip())
