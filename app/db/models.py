@@ -3,19 +3,23 @@ app/db/models.py  –  Supabase table helpers
 
 Fixes applied (this revision)
 ──────────────────────────────
-P1 (Stale 'sending' drafts permanently hidden):
-  Added recover_stale_sending_drafts().  Any draft stuck in 'sending' for
-  longer than SENDING_TIMEOUT_MINUTES (default 10) is reset to 'send_failed'
-  and its parent email back to 'approved', making both visible in Pending
-  Approvals for admin retry.
+P1 (Stale-send recovery could mark an actively-sending draft as failed):
+  recover_stale_sending_drafts() previously used generated_at to decide
+  whether a 'sending' draft was stale.  Any draft created more than
+  SENDING_TIMEOUT_MINUTES ago was immediately eligible for recovery the
+  instant it entered 'sending', even if SMTP was still running.  Scheduled
+  sends were especially exposed: get_and_claim_scheduled_drafts() set only
+  status='sending' with no claim timestamp, so a concurrent pipeline run
+  could flip a legitimately in-flight send to 'send_failed'.
 
-  The stale-detection timestamp uses the draft's generated_at column rather
-  than approved_at.  approved_at is only set on the manual-approval path;
-  drafts claimed by the scheduled-dispatch path (get_and_claim_scheduled_drafts)
-  transition directly to 'sending' without touching approved_at, so using
-  approved_at would miss those rows entirely.  generated_at is always present
-  and provides a safe, conservative upper bound on how long any draft should
-  ever spend in 'sending'.
+  Fix: both claim paths (approve_and_send and get_and_claim_scheduled_drafts)
+  now stamp sending_started_at=utcnow() at the moment status transitions to
+  'sending'.  recover_stale_sending_drafts() filters on sending_started_at
+  instead of generated_at, so a draft is only eligible for recovery after
+  SENDING_TIMEOUT_MINUTES have elapsed since the claim — not since it was
+  first created.  Rows with a NULL sending_started_at (created by old code)
+  fall back to generated_at, preserving the previous conservative behaviour
+  for any pre-existing stuck rows.
 
 P2 (update_draft_if_status hides DB errors):
   Returns the module-level _DB_ERROR sentinel on exception instead of None,
@@ -314,14 +318,18 @@ def recover_stale_sending_drafts() -> int:
     'pending' and 'send_failed', so stale 'sending' drafts are permanently
     invisible.
 
-    Timestamp choice — generated_at, not approved_at:
-    approved_at is only set on the manual-approval path (approve_and_send).
-    Drafts claimed by get_and_claim_scheduled_drafts() go directly from
-    'approved' to 'sending' without updating approved_at, leaving it NULL.
-    A filter on approved_at would therefore miss all scheduled drafts that
-    get stuck.  generated_at is always populated at insert time and provides
-    a safe conservative bound: any draft still in 'sending' more than
-    SENDING_TIMEOUT_MINUTES after it was first created is unambiguously stale.
+    Timestamp choice — sending_started_at:
+    Both claim paths (approve_and_send and get_and_claim_scheduled_drafts) now
+    stamp sending_started_at=utcnow() at the moment they flip the draft to
+    'sending'.  Staleness is measured from that instant, so a draft that was
+    generated hours ago but only just claimed is never incorrectly recovered
+    while SMTP is still in flight.
+
+    Fallback for rows without sending_started_at (NULL):
+    Rows that entered 'sending' before this column existed have no claim time.
+    For those we fall back to generated_at, which preserves the conservative
+    behaviour of the previous implementation and ensures they are eventually
+    recovered rather than hidden forever.
 
     Called at the top of every run_pipeline() pass so the recovery window is
     bounded by poll_interval + SENDING_TIMEOUT_MINUTES.
@@ -333,17 +341,26 @@ def recover_stale_sending_drafts() -> int:
     ).isoformat()
 
     try:
+        # Fetch all drafts currently in 'sending'.  We select both timestamps
+        # so we can apply the correct one per row in Python.
         res = (
             _db().table("draft_responses")
-            .select("id, email_id, generated_at")
+            .select("id, email_id, generated_at, sending_started_at")
             .eq("status", "sending")
-            .lte("generated_at", cutoff)   # generated_at is always set; never NULL
             .execute()
         )
-        stale: list[dict] = res.data or []
+        candidates: list[dict] = res.data or []
     except Exception as exc:
         logger.error(f"recover_stale_sending_drafts: query failed: {exc}")
         return 0
+
+    # A draft is stale when its claim timestamp is older than the cutoff.
+    # Use sending_started_at if present; fall back to generated_at for rows
+    # that pre-date the column (NULL means they were claimed by old code).
+    stale = [
+        d for d in candidates
+        if (d.get("sending_started_at") or d.get("generated_at") or "") <= cutoff
+    ]
 
     if not stale:
         return 0
@@ -355,6 +372,7 @@ def recover_stale_sending_drafts() -> int:
 
     recovered = 0
     for draft in stale:
+        claim_ts = draft.get("sending_started_at") or draft.get("generated_at", "unknown")
         try:
             update_draft(draft["id"], status="send_failed")
             update_email_status(draft["email_id"], "approved")
@@ -362,8 +380,7 @@ def recover_stale_sending_drafts() -> int:
                 draft["email_id"],
                 "send_stale_recovered",
                 f"Draft {draft['id']} was stuck in 'sending' since "
-                f"{draft.get('generated_at', 'unknown')}; reset to 'send_failed' "
-                f"for admin retry.",
+                f"{claim_ts}; reset to 'send_failed' for admin retry.",
             )
             recovered += 1
             logger.info(
@@ -518,7 +535,12 @@ def get_and_claim_scheduled_drafts() -> list[dict]:
     try:
         res = (
             _db().table("draft_responses")
-            .update({"status": "sending"})
+            # FIX P1 (stale-send recovery): stamp sending_started_at so
+            # recover_stale_sending_drafts() measures staleness from the actual
+            # claim time, not from generated_at.  Without this, a draft that was
+            # created more than SENDING_TIMEOUT_MINUTES ago is flagged as stale
+            # the instant it enters 'sending', even if SMTP is still running.
+            .update({"status": "sending", "sending_started_at": now})
             .eq("status", "approved")
             .not_.is_("scheduled_send_at", "null")
             .lte("scheduled_send_at", now)
